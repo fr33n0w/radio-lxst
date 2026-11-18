@@ -90,8 +90,13 @@ def volume_scale(parent, var, length=220):
                     highlightthickness=0, bd=0, sliderlength=14, width=12)
 
 
-def draw_vu(c, w, levels, on):
-    """Two segmented L/R meters at the right edge of an LCD canvas."""
+def _vu_y(db):
+    # same curve as the lit segments: level ** 0.6
+    return 100 - (10 ** (db / 20)) ** 0.6 * VU_SEGS * 3 + 1
+
+
+def draw_vu(c, w, levels, on, ceiling_db=None):
+    """Two segmented L/R meters at the right edge of an LCD canvas, dB scale in between."""
     x0 = w - 96
     for ch, lbl in enumerate(("L", "R")):
         x = x0 + ch * 44
@@ -101,6 +106,11 @@ def draw_vu(c, w, levels, on):
             y = 100 - sgi * 3
             col = RED if sgi >= VU_SEGS - 3 else AMBER if sgi >= VU_SEGS - 8 else LCD
             c.create_rectangle(x, y - 2, x + 20, y, outline="", fill=col if sgi < lit else "#0d1a0d")
+    for db in (0, -6, -12, -24):
+        c.create_text(x0 + 32, _vu_y(db), text=str(db), fill=LCD_DIM, font=LCD_SMALL)
+    if ceiling_db is not None:
+        y = _vu_y(ceiling_db)
+        c.create_line(x0 - 3, y, x0 + 67, y, fill=AMBER)
 
 
 def draw_badge(c, w, text, on, blink, color=RED):

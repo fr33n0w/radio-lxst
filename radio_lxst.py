@@ -24,13 +24,15 @@ except Exception:
 from LXST.Codecs import Opus
 from LXST.Codecs.libs.pyogg import opus, OpusEncoder
 
-__version__ = "0.2"
+__version__ = "0.3"
 
 APP_NAME = "lxst"
 ASPECT = "telephony"
 STATION_ASPECT = ("radiolxst", "station")
 FIELD_META = "radiolxst"
 META_REFRESH = 30
+ANNOUNCE_MIN_EVERY = 20  # minutes, periodic announces never more often
+ANNOUNCE_MIN_GAP = 600   # seconds between any two announces (manual, on air, stop)
 FIELD_SIGNALLING = 0x00
 FIELD_FRAMES = 0x01
 CODEC_OPUS = b"\x01"
@@ -238,19 +240,14 @@ def _device_label(dev):
 
 
 def list_inputs():
-    """Input device labels (mics, line in, virtual cables, loopback of outputs), read in a worker thread."""
-    out = []
+    """Input device labels (mics, line in, virtual cables, loopback of outputs)."""
+    from radio_client import com_call
+    return com_call(lambda: [_device_label(d) for d in _soundcard().all_microphones(include_loopback=True)]) or []
 
-    def job():
-        try:
-            out.extend(_device_label(d) for d in _soundcard().all_microphones(include_loopback=True))
-        except Exception as e:
-            RNS.log(f"Could not list input devices: {e}", RNS.LOG_WARNING)
 
-    t = threading.Thread(target=job, daemon=True)
-    t.start()
-    t.join(5)
-    return out
+def default_output_name():
+    from radio_client import com_call
+    return com_call(lambda: _soundcard().default_speaker().name) or ""
 
 
 class LineSource:
@@ -280,9 +277,12 @@ class LineSource:
 
     def _loop(self):
         while self.running:
+            from radio_client import AUDIO_LOCK, locked_audio
             dev = None
             try:
-                dev = self._open()
+                with AUDIO_LOCK:
+                    dev = self._open()
+                    ch = max(1, int(dev.channels)) if dev else 1
             except Exception as e:
                 RNS.log(f"Input error: {e}", RNS.LOG_ERROR)
             if dev is None:
@@ -291,9 +291,8 @@ class LineSource:
                 time.sleep(5)
                 continue
             try:
-                ch = max(1, int(dev.channels))
-                with dev.recorder(samplerate=SAMPLE_RATE, channels=min(ch, CHANNELS),
-                                  blocksize=FRAME_SAMPLES // 4) as rec:
+                with locked_audio(lambda: dev.recorder(samplerate=SAMPLE_RATE, channels=min(ch, CHANNELS),
+                                                       blocksize=FRAME_SAMPLES // 4)) as rec:
                     self.state = "live"
                     while self.running:
                         x = np.asarray(rec.record(numframes=FRAME_SAMPLES), dtype=np.float32)
@@ -343,10 +342,14 @@ class Radio:
     def __init__(self, identity, name="radio-lxst"):
         self.identity, self.name = identity, name
         self.source = None
+        self.monitor = None  # local listening, a Player from radio_client
         self.on_air = False
         self.announce_on_start = True
-        self.announce_every_min = 15
+        self._every = 60
         self.last_announce = 0
+        self.stamps_done = 0
+        self.stamps_ready = False
+        self.pending_source = None  # On air pressed while stamps are still being made
         self.listeners = {}
         self.lock = threading.Lock()
         self.encoders = {}
@@ -369,15 +372,60 @@ class Radio:
         # path responses re-announce with the default app data: keep name and info in them too
         self.station.set_default_app_data(self.station_info)
         self.lxmf.set_default_app_data(lambda: mp.packb([self.name.encode("utf-8"), None]))
+        threading.Thread(target=self._prepare_stamps, daemon=True).start()
         threading.Thread(target=self._announce_loop, daemon=True).start()
         threading.Thread(target=self._meta_loop, daemon=True).start()
         threading.Thread(target=self._send_loop, daemon=True).start()
 
     @property
+    def announce_every_min(self):
+        return self._every
+
+    @announce_every_min.setter
+    def announce_every_min(self, minutes):
+        minutes = max(0, int(minutes))
+        self._every = max(ANNOUNCE_MIN_EVERY, minutes) if minutes else 0
+
+    def announce_wait(self):
+        """Seconds until the next announce is allowed, 0 = now."""
+        return max(0.0, self.last_announce + ANNOUNCE_MIN_GAP - time.time())
+
+    @property
     def identity_hash(self):
         return self.identity.hash.hex()
 
+    def _stamp_dests(self):
+        return (self.dest, self.lxmf, self.station)
+
+    def _prepare_stamps(self):
+        """Make the announce stamps (RNS 1.6.1+) before going on air: done once, then reused from disk."""
+        if getattr(RNS.Transport, "STAMP_DESTINATIONS", False):
+            todo = [d for d in self._stamp_dests() if hasattr(d, "_await_stamp") and d.stamp is None]
+            self.stamps_done = len(self._stamp_dests()) - len(todo)
+            for d in todo:
+                t = time.time()
+                try:
+                    d._await_stamp()
+                except Exception as e:
+                    RNS.log(f"Stamp for {RNS.prettyhexrep(d.hash)} failed: {e}", RNS.LOG_ERROR)
+                self.stamps_done += 1
+                if time.time() - t > 1:
+                    RNS.log(f"Stamp {self.stamps_done}/3 ready in {time.time() - t:.0f} s", RNS.LOG_NOTICE)
+        self.stamps_done = len(self._stamp_dests())
+        self.stamps_ready = True
+        src, self.pending_source = self.pending_source, None
+        if src:
+            self.start(src)
+
     def start(self, source):
+        if not self.stamps_ready:
+            # nobody could find the station yet, and making stamps would stall the audio
+            if self.pending_source:
+                self.pending_source.stop()
+            self.pending_source = source
+            RNS.log("Preparing stamps (first start only, can take a few minutes), on air when ready",
+                    RNS.LOG_NOTICE)
+            return
         if self.on_air:
             self.stop()
         self.encoders = {}
@@ -397,13 +445,17 @@ class Radio:
         RNS.log(f"Source switched to {source_label(source)}", RNS.LOG_NOTICE)
 
     def stop(self):
+        if self.pending_source:
+            self.pending_source.stop()
+            self.pending_source = None
         was_on = self.on_air
         self.on_air = False
         self.on_air_since = None
-        if was_on:
+        if was_on and not self.announce_wait():
             # tell the directory we are off air
             try:
                 self.station.announce(app_data=self.station_info())
+                self.last_announce = time.time()
             except Exception:
                 pass
         with self.lock:
@@ -420,17 +472,26 @@ class Radio:
         RNS.log(f"{self.name} off air", RNS.LOG_NOTICE)
 
     def announce(self):
+        """Announce all three destinations; returns False if the last one was under 10 min ago."""
+        wait = self.announce_wait()
+        if wait:
+            RNS.log(f"Announce skipped, next one allowed in {wait / 60:.0f} min", RNS.LOG_NOTICE)
+            return False
         self.dest.announce()
         self.lxmf.announce(app_data=mp.packb([self.name.encode("utf-8"), None]))
         self.station.announce(app_data=self.station_info())
         self.last_announce = time.time()
-        RNS.log(f"Announced {self.name}", RNS.LOG_NOTICE)
+        if self.stamps_ready:
+            RNS.log(f"Announced {self.name}", RNS.LOG_NOTICE)
+        else:
+            RNS.log(f"Announce of {self.name} queued until the stamps are ready", RNS.LOG_NOTICE)
+        return True
 
     def meta(self):
         with self.lock:
             n = sum(1 for l in self.listeners.values() if l.state == "listening")
         src = self.source
-        np_ = src.now_playing if src and src.folder else ""
+        np_ = (src.now_playing if src.folder else "Live streaming") if src else ""
         return {"v": __version__, "n": self.name[:48], "l": n, "np": np_[:64],
                 "kb": 28 if FRAME_MS >= 120 else 56, "air": self.on_air}
 
@@ -577,6 +638,9 @@ class Radio:
                 frame = np.clip(frame, -1.0, 1.0)
             peak = np.abs(frame).max(axis=0)
             self.levels = (float(peak[0]), float(peak[1]))
+            mon = self.monitor
+            if mon is not None:
+                mon.push(frame)
             with self.lock:
                 active = [l for l in self.listeners.values() if l.state == "listening"]
             if not active:
@@ -621,9 +685,13 @@ class Radio:
             "source_state": src.state if src else "off", "now_playing": src.now_playing if src else "",
             "levels": self.levels, "late_ms": self.max_late * 1000,
             "gain_db": self.gain_db, "limiter_on": self.limiter_on,
+            "ceiling_db": self.limiter.ceiling_db,
             "reduction_db": self.limiter.reduction_db if self.limiter_on and self.on_air else 0.0,
             "next_announce": (self.last_announce + self.announce_every_min * 60 - now)
             if self.on_air and self.announce_every_min else None,
+            "announce_wait": self.announce_wait(),
+            "stamps_ready": self.stamps_ready, "stamps_done": self.stamps_done,
+            "waiting": self.pending_source is not None,
         }
 
     def status_text(self):
@@ -631,6 +699,8 @@ class Radio:
         lines = [f"[{time.strftime('%H:%M:%S')}] {self.name}  listeners {s['listeners']}  "
                  f"(total calls {s['calls']}, buffer {s['buffer_ms']} ms, {FRAME_MS} ms frames, "
                  f"send late max {s['late_ms']:.0f} ms)"]
+        if s["waiting"]:
+            lines[0] += f"  preparing stamps {s['stamps_done']}/3, on air when ready"
         self.max_late = 0.0
         for r in s["rows"]:
             dur = RNS.prettytime(r["time"]) if r["state"] == "listening" else r["state"]
@@ -662,7 +732,7 @@ def main():
     ap.add_argument("--rnsconfig", default=None, help="Reticulum config dir")
     ap.add_argument("--frame-ms", type=int, choices=[60, 120], default=120,
                     help="120 = steadier on slow paths (max ~28 kbit/s), 60 = up to 56 kbit/s")
-    ap.add_argument("--announce-every", type=int, default=15, help="minutes between announces, 0 = only at start")
+    ap.add_argument("--announce-every", type=int, default=60, help=f"minutes between announces (min {ANNOUNCE_MIN_EVERY}), 0 = only at start")
     ap.add_argument("--gain", type=float, default=0.0, help="output volume in dB (-24..+12)")
     ap.add_argument("--no-limiter", action="store_true", help="disable the peak limiter")
     ap.add_argument("--ceiling", type=float, default=-2.0, help="limiter ceiling in dBFS")
@@ -682,7 +752,7 @@ def main():
     radio.limiter.ceiling_db = min(0.0, a.ceiling)
     radio.start(LineSource(a.input) if a.input else Source(url=a.url, folder=a.folder, shuffle=a.shuffle))
 
-    print(f"\n  {a.name}  on air")
+    print(f"\n  {a.name}  " + ("on air" if radio.on_air else "preparing stamps, on air when ready"))
     print(f"  Call this identity from Sideband / rnphone:  {radio.identity_hash}")
     print(f"  LXST destination: {radio.dest.hash.hex()}   LXMF: {radio.lxmf.hash.hex()}")
     print(f"  Source: {a.url or a.folder or a.input}\n")

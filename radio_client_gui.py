@@ -6,6 +6,7 @@ import sys
 import json
 import time
 import queue
+import faulthandler
 import tkinter as tk
 from tkinter import ttk
 
@@ -16,11 +17,29 @@ from ui_common import (BG, LCD, LCD_DIM, AMBER, RED, DIM, UI_FONT, TITLE_FONT, L
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SETTINGS = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.path.join(HERE, "client_settings.json")
-DEFAULTS = {"call_id": "", "quality": "SHQ", "volume_db": 0.0, "buffer_s": 2.0, "device": "",
+DEFAULTS = {"call_id": "", "quality": "SHQ", "volume_db": 0.0, "buffer_s": 3.0, "device": "",
             "identity": os.path.join(HERE, "storage", "client_identity"), "rnsconfig": "", "autoplay": False}
 BADGES = {"playing": ("PLAYING", LCD), "buffering": ("BUFFER", AMBER), "searching": ("SEARCH", AMBER),
+          "retrying": ("RETRY", AMBER),
           "connecting": ("CONNECT", AMBER), "ringing": ("RINGING", AMBER), "failed": ("FAILED", RED),
           "ended": ("ENDED", RED)}
+
+
+def open_log(name, keep=1_000_000):
+    """storage/<name>, emptied when it grows past keep bytes."""
+    try:
+        path = os.path.join(HERE, "storage", name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        big = os.path.isfile(path) and os.path.getsize(path) > keep
+        return open(path, "w" if big else "a", encoding="utf-8")
+    except OSError:
+        return None
+
+
+LOGFILE = open_log("client.log")
+_crash = open_log("client_crash.log")
+if _crash:
+    faulthandler.enable(file=_crash, all_threads=True)  # native crashes leave a trace even under pythonw
 
 
 def load_settings():
@@ -62,7 +81,7 @@ class App:
         RNS.Reticulum(configdir=self.s["rnsconfig"] or None, loglevel=RNS.LOG_NOTICE)
         RNS.logtimefmt = "%H:%M:%S"
         RNS.logdest = RNS.LOG_CALLBACK
-        RNS.logcall = lambda line: self.logq.put(line)
+        RNS.logcall = self._logline
         self.dir = rc.Directory(os.path.join(HERE, "storage", "stations.json"))
         self.dir.on_change = lambda: setattr(self, "dir_dirty", True)
         self.client = rc.Client(rc.load_identity(self.s["identity"]), float(self.s["buffer_s"]),
@@ -72,7 +91,7 @@ class App:
         root.protocol("WM_DELETE_WINDOW", self.quit)
         self.log(f"radio-lxst client {rc.__version__} ready")
         if self.s.get("autoplay") and self.s["call_id"]:
-            root.after(800, self.play)
+            root.after(800, lambda: self.play("autoplay"))
         self._update()
 
     def _build(self):
@@ -89,14 +108,14 @@ class App:
 
         bar = tk.Frame(r, bg=BG)
         bar.pack(fill="x", padx=8)
-        ttk.Button(bar, text="▶  Play", style="Air.TButton", command=self.play).pack(side="left", padx=(0, 6))
+        ttk.Button(bar, text="▶  Play", style="Air.TButton", command=lambda: self.play("Play button")).pack(side="left", padx=(0, 6))
         self.b_stop = ttk.Button(bar, text="■  Stop", style="Stop.TButton", command=self.stop)
         self.b_stop.pack(side="left", padx=(0, 10))
         tk.Label(bar, text="Call ID", bg=BG, fg=DIM, font=UI_FONT).pack(side="left")
         self.v_call = tk.StringVar(value=self.s["call_id"])
         e = ttk.Entry(bar, textvariable=self.v_call, width=34)
         e.pack(side="left", padx=4)
-        e.bind("<Return>", lambda ev: self.play())
+        e.bind("<Return>", lambda ev: self.play("Enter"))
         self.v_quality = tk.StringVar(value=self.s["quality"])
         ttk.Combobox(bar, textvariable=self.v_quality, values=list(rc.PROFILES), width=5,
                      state="readonly").pack(side="left", padx=4)
@@ -143,12 +162,12 @@ class App:
             self.tree.heading(c, text=t)
             self.tree.column(c, width=w, anchor="e" if c in ("lst", "hops") else "w")
         self.tree.pack(fill="both", expand=True)
-        self.tree.bind("<Double-Button-1>", lambda ev: self._tune_selected())
+        self.tree.bind("<Double-Button-1>", self._tune_clicked)
         self.tree.bind("<Button-3>", self._station_menu)
         self.tree.bind("<Control-c>", lambda ev: self._copy_selected())
         row = ttk.Frame(f)
         row.pack(fill="x", pady=(6, 0))
-        ttk.Button(row, text="Listen", command=self._tune_selected).pack(side="left")
+        ttk.Button(row, text="Listen", command=lambda: self._tune_selected("Listen button")).pack(side="left")
         ttk.Button(row, text="Copy Call ID", command=self._copy_selected).pack(side="left", padx=6)
         ttk.Button(row, text="Forget", command=self._forget_selected).pack(side="left")
         self.v_auto = tk.BooleanVar(value=bool(self.s.get("autoplay")))
@@ -163,7 +182,7 @@ class App:
         self.tree.selection_set(cid)
         name = self.dir.name_of(cid)
         context_menu(self.root, ev, [
-            ("Listen", self._tune_selected),
+            ("Listen", lambda: self._tune_selected("menu")),
             None,
             ("Copy Call ID", lambda: self.copied("Call ID", cid)),
             ("Copy LXMF address", lambda: self.copied("LXMF address", hash_of("lxmf.delivery", cid))),
@@ -187,7 +206,7 @@ class App:
         return ["default"] + rc.list_devices()
 
     # actions
-    def play(self):
+    def play(self, why=""):
         cid = self.v_call.get().strip().lower()
         if not cid:
             return self.log("Pick a station or paste a Call ID")
@@ -195,16 +214,24 @@ class App:
         p = self.client.player
         p.prefill = self._buf()
         p.device = None if self.v_dev.get() == "default" else self.v_dev.get()
-        self.client.tune(cid, rc.PROFILES.get(self.v_quality.get(), 0x60), self.dir.name_of(cid))
+        self.client.tune(cid, rc.PROFILES.get(self.v_quality.get(), 0x60), self.dir.name_of(cid), why)
 
     def stop(self):
         self.client.hangup()
 
-    def _tune_selected(self):
+    def _tune_selected(self, why=""):
         sel = self.tree.selection()
         if sel:
             self.v_call.set(sel[0])
-            self.play()
+            self.play(why)
+
+    def _tune_clicked(self, ev):
+        # the row under the mouse, not the selection: the list may have been redrawn between the clicks
+        cid = self.tree.identify_row(ev.y)
+        if cid:
+            self.tree.selection_set(cid)
+            self.v_call.set(cid)
+            self.play("double click")
 
     def _forget_selected(self):
         for cid in self.tree.selection():
@@ -216,7 +243,7 @@ class App:
         try:
             return max(0.5, min(10.0, float(self.v_buf.get())))
         except ValueError:
-            return 2.0
+            return 3.0
 
     def _changed(self):
         g = round(float(self.v_vol.get()) * 2) / 2
@@ -230,6 +257,15 @@ class App:
                 json.dump(self.s, f, indent=2)
         except OSError:
             pass
+
+    def _logline(self, line):
+        self.logq.put(line)
+        if LOGFILE:
+            try:
+                LOGFILE.write(time.strftime("%Y-%m-%d ") + line + "\n")
+                LOGFILE.flush()
+            except Exception:
+                pass
 
     def log(self, msg):
         self.logq.put(f"[{time.strftime('%H:%M:%S')}] {msg}")

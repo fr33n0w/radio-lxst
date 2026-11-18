@@ -21,7 +21,7 @@ except Exception:
 
 from LXST.Codecs import Opus
 
-__version__ = "0.2"
+__version__ = "0.3"
 
 STATION_ASPECT = "radiolxst.station"
 FIELD_SIGNALLING = 0x00
@@ -36,6 +36,26 @@ CHANNELS = 2
 
 PROFILES = {"SHQ": 0x60, "HQ": 0x50, "MQ": 0x40, "LBW": 0x30, "VLBW": 0x20, "ULBW": 0x10}
 
+PATH_WAIT = 20                  # seconds for a path answer
+ANSWER_WAIT = 30                # seconds for the station to answer
+DIAL_TRIES = 2                  # second try drops the path first: the first one can be stale
+RETRY_WAITS = (15, 30, 60, 120)  # pauses before redialing after a drop while playing
+NO_AUDIO_S = 20                 # playing but no audio this long = lost (RNS notices a dead link much later)
+STEADY_S = 60                   # this much good listening resets the retry count
+
+
+def drop_path(dh):
+    """Forget a path here and in the shared rnsd (like rnpath -d), so the next request gets a fresh one."""
+    try:
+        RNS.Reticulum.get_instance().drop_path(dh)
+    except Exception:
+        pass
+    try:
+        with RNS.Transport.path_table_lock:
+            RNS.Transport.path_table.pop(dh, None)
+    except Exception:
+        pass
+
 
 class _Sink:
     channels = CHANNELS
@@ -49,29 +69,68 @@ def _com_init():
         soundcard._com.init_com()
 
 
-def list_devices():
-    """Output device names, read in a worker thread so the GUI thread never touches COM."""
-    out = []
+# LXST's Windows soundcard crashes if two threads enumerate or open devices at once
+AUDIO_LOCK = threading.RLock()
 
-    def job():
-        try:
+
+class locked_audio:
+    """Create, enter and exit an LXST player/recorder under AUDIO_LOCK; play/record stay unlocked."""
+
+    def __init__(self, make):
+        self.make = make
+
+    def __enter__(self):
+        with AUDIO_LOCK:
+            self.cm = self.make()
+            return self.cm.__enter__()
+
+    def __exit__(self, *exc):
+        with AUDIO_LOCK:
+            return self.cm.__exit__(*exc)
+
+
+_com_jobs = None
+
+
+def com_call(fn, timeout=5):
+    """Run fn on one long-lived audio thread: keeps COM alive on Windows, the GUI thread never touches it."""
+    global _com_jobs
+    if _com_jobs is None:
+        import queue
+        _com_jobs = queue.Queue()
+
+        def worker():
             _com_init()
-            from LXST.Sinks import Backend
-            out.extend(s.name for s in Backend().all_speakers())
-        except Exception as e:
-            RNS.log(f"Could not list audio devices: {e}", RNS.LOG_WARNING)
+            while True:
+                f, box, done = _com_jobs.get()
+                try:
+                    with AUDIO_LOCK:
+                        box.append(f())
+                except Exception as e:
+                    RNS.log(f"Audio device error: {e}", RNS.LOG_WARNING)
+                done.set()
 
-    t = threading.Thread(target=job, daemon=True)
-    t.start()
-    t.join(5)
-    return out
+        threading.Thread(target=worker, daemon=True).start()
+    box, done = [], threading.Event()
+    _com_jobs.put((fn, box, done))
+    done.wait(timeout)
+    return box[0] if box else None
+
+
+def list_devices():
+    """Output device names."""
+    def job():
+        from LXST.Sinks import Backend
+        return [s.name for s in Backend().all_speakers()]
+    return com_call(job) or []
 
 
 class Player:
     """Jitter buffer + sound card output. Starts after `prefill` seconds of audio, rebuffers on underrun."""
 
-    def __init__(self, prefill=2.0, device=None):
+    def __init__(self, prefill=2.0, device=None, max_extra=4.0):
         self.prefill = prefill
+        self.max_extra = max_extra
         self.device = device
         self.volume_db = 0.0
         self.frames = deque()
@@ -82,6 +141,8 @@ class Player:
         self.levels = (0.0, 0.0)
         self.running = False
         self._run_id = 0
+        self._wake = threading.Event()
+        self._thread = None
 
     @property
     def buffer_s(self):
@@ -91,18 +152,29 @@ class Player:
         with self.lock:
             self.frames.append(frame)
             self.buffered += len(frame)
-            # cap latency at prefill + 4 s
-            limit = (self.prefill + 4) * SAMPLE_RATE
+            limit = (self.prefill + self.max_extra) * SAMPLE_RATE
             while self.buffered > limit and len(self.frames) > 1:
                 self.buffered -= len(self.frames.popleft())
 
     def start(self):
         if self.running:
             return
-        self.running = True
         self.state = "buffering"
         self._run_id += 1
-        threading.Thread(target=self._run, args=(self._run_id,), daemon=True).start()
+        self.running = True
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._worker, daemon=True)
+            self._thread.start()
+        self._wake.set()
+
+    def _worker(self):
+        # one audio thread for the whole life: no overlapping players, no reused COM thread ids
+        _com_init()
+        while True:
+            self._wake.wait()
+            self._wake.clear()
+            if self.running:
+                self._run(self._run_id)
 
     def stop(self):
         self.running = False
@@ -122,16 +194,15 @@ class Player:
 
     def _run(self, run_id):
         try:
-            _com_init()
             from LXST.Sinks import Backend
-            backend = Backend(preferred_device=self.device)
+            with AUDIO_LOCK:
+                backend = Backend(preferred_device=self.device)
         except Exception as e:
             RNS.log(f"No audio output: {e}", RNS.LOG_ERROR)
             self.state = "no audio output"
             return
         target = self.prefill
-        with backend.get_player(samples_per_frame=SAMPLE_RATE // 50) as player:
-            # an older thread still inside play() exits here instead of sharing the queue
+        with locked_audio(lambda: backend.get_player(samples_per_frame=SAMPLE_RATE // 50)) as player:
             while self.running and run_id == self._run_id:
                 if self.state == "buffering":
                     if self.buffer_s >= target:
@@ -224,7 +295,7 @@ class Directory:
 
 
 class Client:
-    def __init__(self, identity, prefill=2.0, device=None):
+    def __init__(self, identity, prefill=3.0, device=None):
         self.identity = identity
         self.player = Player(prefill, device)
         self.link = None
@@ -239,16 +310,23 @@ class Client:
         self.decoder = None
         self._gen = 0
         self.meta = {}
+        self.retries = 0
+        self.last_audio = 0.0
+        self._retry_lock = threading.Lock()
+        self._lock = threading.RLock()  # tune/hangup vs packets of the old link
 
-    def tune(self, call_id, profile=None, name=""):
+    def tune(self, call_id, profile=None, name="", why=""):
         self.hangup()
-        self._gen += 1
-        gen = self._gen
-        self.call_id = call_id.strip().lower()
-        self.station_name = name
-        self.meta = {}
+        with self._lock:
+            self._gen += 1
+            gen = self._gen
+            self.call_id = call_id.strip().lower()
+            self.station_name = name
+            self.meta = {}
+        RNS.log(f"Tuning to {self.call_id}" + (f" ({why})" if why else ""), RNS.LOG_NOTICE)
         if profile is not None:
             self.profile = profile
+        self.retries = 0
         self.state, self.message = "searching", "looking for a path"
         threading.Thread(target=self._dial, args=(gen,), daemon=True).start()
 
@@ -261,20 +339,38 @@ class Client:
             self._fail("invalid Call ID")
             return
         dh = RNS.Destination.hash_from_name_and_identity("lxst.telephony", ident_hash)
+        why = None
+        for i in range(DIAL_TRIES):
+            why = self._attempt(gen, dh, fresh=i > 0)
+            if why in (None, "ok", "rejected"):
+                return
+        if self.retries:
+            self._schedule_retry(gen, why)
+        else:
+            self._fail(why)
+
+    def _attempt(self, gen, dh, fresh):
+        """One try: path (a fresh one if asked) + call. Returns ok, rejected, a failure reason, or None if cancelled."""
+        if fresh:
+            self.state, self.message = "searching", "asking for a fresh path"
+            drop_path(dh)
         if not RNS.Transport.has_path(dh):
             RNS.Transport.request_path(dh)
             t = time.time()
-            while not RNS.Transport.has_path(dh) and time.time() - t < 20:
+            while not RNS.Transport.has_path(dh) and time.time() - t < PATH_WAIT:
                 if gen != self._gen:
-                    return
+                    return None
                 time.sleep(0.2)
         remote = RNS.Identity.recall(dh)
         if gen != self._gen:
-            return
+            return None
         if not remote:
-            self._fail("no path to the station")
-            return
-        self.state, self.message = "connecting", f"{RNS.Transport.hops_to(dh)} hops"
+            return "no path to the station"
+        if remote.hash.hex() != self.call_id:
+            RNS.log(f"Path for {self.call_id} gave identity {remote.hash.hex()}", RNS.LOG_WARNING)
+            return "wrong identity on the path"
+        self.state, self.message = "connecting", (f"{RNS.Transport.hops_to(dh)} hops"
+                                                  if RNS.Transport.has_path(dh) else "")
         dest = RNS.Destination(remote, RNS.Destination.OUT, RNS.Destination.SINGLE, "lxst", "telephony")
         self.decoder = Opus()
         self.decoder.sink = _Sink()
@@ -283,10 +379,21 @@ class Client:
         link.set_packet_callback(lambda data, packet: self._packet(link, data, gen))
         self.link = link
         t = time.time()
-        while gen == self._gen and self.state in ("connecting", "ringing") and time.time() - t < 30:
+        while gen == self._gen and self.state in ("connecting", "ringing") and time.time() - t < ANSWER_WAIT \
+                and link.status != RNS.Link.CLOSED:
             time.sleep(0.2)
-        if gen == self._gen and self.state in ("connecting", "ringing"):
-            self._fail("no answer")
+        if gen != self._gen:
+            return None
+        if self.state == "playing":
+            return "ok"
+        if self.state == "failed":
+            return "rejected"
+        self.link = None
+        try:
+            link.teardown()
+        except Exception:
+            pass
+        return "no answer"
 
     def _signal(self, link, signals):
         RNS.Packet(link, mp.packb({FIELD_SIGNALLING: signals}), create_receipt=False).send()
@@ -300,6 +407,11 @@ class Client:
             return
         if not isinstance(msg, dict):
             return
+        with self._lock:
+            if gen == self._gen and link is self.link:
+                self._handle(link, msg, gen, len(data))
+
+    def _handle(self, link, msg, gen, size):
         for s in msg.get(FIELD_SIGNALLING, []) if isinstance(msg.get(FIELD_SIGNALLING), list) else []:
             if s == STATUS_AVAILABLE:
                 link.identify(self.identity)
@@ -308,8 +420,9 @@ class Client:
                 self._signal(link, [PREFERRED_PROFILE + self.profile, PREFERRED_MODE + MODE_HALF_DUPLEX])
             elif s == STATUS_ESTABLISHED:
                 self.state, self.message = "playing", ""
-                self.started = time.time()
+                self.started = self.last_audio = time.time()
                 self.player.start()
+                threading.Thread(target=self._watch, args=(gen, link), daemon=True).start()
                 RNS.log(f"Tuned in to {self.station_name or self.call_id}", RNS.LOG_NOTICE)
             elif s in (STATUS_BUSY, STATUS_REJECTED):
                 self._fail("station busy or off air")
@@ -326,18 +439,69 @@ class Client:
                 try:
                     pcm = self.decoder.decode(f[1:])
                     self.player.push(pcm)
+                    self.last_audio = time.time()
                     self.frames += 1
-                    self.bytes += len(data)
+                    self.bytes += size
                 except Exception as e:
                     RNS.log(f"Decode error: {e}", RNS.LOG_DEBUG)
 
     def _closed(self, link, gen):
+        if gen != self._gen or link is not self.link:
+            return
+        if self.state != "playing":
+            return  # while connecting, _attempt sees the closed link
+        self.player.stop()
+        if link.teardown_reason == RNS.Link.TIMEOUT:
+            RNS.log("Lost the station (network)", RNS.LOG_NOTICE)
+            self._schedule_retry(gen, "lost the station", link)
+            return
+        RNS.log("Station closed the link", RNS.LOG_NOTICE)
+        self.state, self.message = "ended", "the station hung up"
+
+    def _watch(self, gen, link):
+        while gen == self._gen and self.link is link and self.state == "playing":
+            time.sleep(1)
+            now = time.time()
+            if self.retries and now - self.started > STEADY_S:
+                self.retries = 0
+            if now - self.last_audio > NO_AUDIO_S and gen == self._gen and self.link is link:
+                RNS.log(f"No audio for {NO_AUDIO_S} s", RNS.LOG_NOTICE)
+                self._schedule_retry(gen, "no audio from the station", link)
+                return
+
+    def _schedule_retry(self, gen, why, dropped=None):
+        """After a drop while playing: try again with growing pauses, then give up."""
+        with self._retry_lock:
+            if gen != self._gen or (dropped is not None and dropped is not self.link):
+                return  # cancelled, or this drop is already being handled
+            if self.retries >= len(RETRY_WAITS):
+                self._fail(f"{why}, gave up after {len(RETRY_WAITS)} retries")
+                return
+            wait = RETRY_WAITS[self.retries]
+            self.retries += 1
+            link, self.link = self.link, None
+            self.state = "retrying"
+        if link:
+            try:
+                link.teardown()
+            except Exception:
+                pass
+        self.player.stop()
+        self.state = "retrying"
+        RNS.log(f"{why}: retry {self.retries}/{len(RETRY_WAITS)} in {wait} s", RNS.LOG_NOTICE)
+        threading.Thread(target=self._retry, args=(gen, wait), daemon=True).start()
+
+    def _retry(self, gen, wait):
+        end = time.time() + wait
+        while time.time() < end:
+            if gen != self._gen:
+                return
+            self.message = f"retry {self.retries}/{len(RETRY_WAITS)} in {end - time.time():.0f} s"
+            time.sleep(0.5)
         if gen != self._gen:
             return
-        if self.state in ("playing", "connecting", "ringing"):
-            RNS.log("Station closed the link", RNS.LOG_NOTICE)
-            self.state, self.message = "ended", "the station hung up"
-        self.player.stop()
+        self.state, self.message = "searching", f"retry {self.retries}/{len(RETRY_WAITS)}"
+        self._dial(gen)
 
     def _fail(self, why):
         self.state, self.message = "failed", why
@@ -350,7 +514,8 @@ class Client:
                 pass
 
     def hangup(self):
-        self._gen += 1
+        with self._lock:
+            self._gen += 1
         if self.link:
             try:
                 self.link.teardown()
@@ -364,9 +529,11 @@ class Client:
     def snapshot(self):
         el = time.time() - self.started if self.started and self.state == "playing" else 0
         p = self.player
+        with self._lock:
+            cid, name, meta = self.call_id or "", self.station_name, self.meta
         return {
-            "state": self.state, "message": self.message, "call_id": self.call_id or "",
-            "name": self.station_name, "listeners": self.meta.get("l"), "track": str(self.meta.get("np") or ""),
+            "state": self.state, "message": self.message, "call_id": cid,
+            "name": name, "listeners": meta.get("l"), "track": str(meta.get("np") or ""),
             "time": el, "kbps": self.bytes * 8 / el / 1000 if el > 1 else 0,
             "buffer_s": p.buffer_s, "player": p.state, "underruns": p.underruns, "levels": p.levels,
             "hops": (RNS.Transport.hops_to(self.link.destination.hash)
@@ -389,7 +556,7 @@ def main():
     ap.add_argument("call_id", nargs="?", help="station Call ID (identity hash)")
     ap.add_argument("--list", type=int, metavar="SEC", help="listen for station announces for SEC seconds")
     ap.add_argument("--quality", choices=list(PROFILES), default="SHQ")
-    ap.add_argument("--buffer", type=float, default=2.0, help="seconds of audio buffered before playing")
+    ap.add_argument("--buffer", type=float, default=3.0, help="seconds of audio buffered before playing")
     ap.add_argument("--volume", type=float, default=0.0, help="dB")
     ap.add_argument("--device", default=None, help="output device (part of its name)")
     ap.add_argument("--identity", default=os.path.join(here, "storage", "client_identity"))

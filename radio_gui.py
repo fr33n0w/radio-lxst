@@ -11,16 +11,17 @@ from tkinter import ttk, filedialog
 
 import RNS
 import radio_lxst as rl
-from ui_common import (BG, EDGE, LCD_BG, DIM, LCD, LCD_DIM, AMBER, UI_FONT, TITLE_FONT, LCD_FONT, LCD_BIG, hms,
+import radio_client as rc
+from ui_common import (LCD_BOLD, BG, EDGE, LCD_BG, DIM, LCD, LCD_DIM, AMBER, UI_FONT, TITLE_FONT, LCD_FONT, LCD_BIG, hms,
                        apply_style, volume_scale, draw_vu, draw_badge, LogBox, copy_text, context_menu, hash_of)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SETTINGS = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.path.join(HERE, "settings.json")
 DEFAULTS = {
     "name": "radio-lxst", "mode": "url", "url": "", "folder": "", "shuffle": False, "input_device": "",
-    "frame_ms": 120, "announce_on_start": True, "announce_every_min": 15,
+    "frame_ms": 120, "announce_on_start": True, "announce_every_min": 60,
     "identity": os.path.join(HERE, "storage", "identity"), "rnsconfig": "", "auto_start": False,
-    "gain_db": 0.0, "limiter_on": True, "limiter_ceiling_db": -2.0,
+    "gain_db": 0.0, "limiter_on": True, "limiter_ceiling_db": -2.0, "monitor_device": "",
 }
 
 def load_settings():
@@ -120,6 +121,7 @@ class App:
         self.status.pack(fill="x", padx=10, pady=(0, 6))
         # click on the CALL ID line of the display copies it
         self.lcd.tag_bind("cid", "<Button-1>", lambda ev: self.copy_id())
+        self.lcd.tag_bind("mon", "<Button-1>", lambda ev: self.toggle_monitor())
 
     def _tab_listeners(self, nb):
         f = ttk.Frame(nb, padding=6)
@@ -204,8 +206,12 @@ class App:
         row = ttk.Frame(f)
         row.grid(row=4, column=1, columnspan=2, sticky="w")
         ttk.Label(row, text="every").pack(side="left")
-        ttk.Spinbox(row, from_=0, to=720, width=5, textvariable=self.v_ann_every).pack(side="left", padx=4)
-        ttk.Label(row, text="minutes (0 = off)").pack(side="left")
+        sb = ttk.Spinbox(row, values=(0, 20, 30, 45, 60, 90, 120, 180, 240, 360, 720), width=5,
+                         textvariable=self.v_ann_every)
+        sb.pack(side="left", padx=4)
+        sb.bind("<FocusOut>", lambda e: self.v_ann_every.set(str(self.radio.announce_every_min)))
+        ttk.Label(row, text=f"minutes (0 = off, min {rl.ANNOUNCE_MIN_EVERY}; "
+                            f"at most one announce every {rl.ANNOUNCE_MIN_GAP // 60} min)").pack(side="left")
         self.ann_info = ttk.Label(f, text="", style="Dim.TLabel")
         self.ann_info.grid(row=5, column=1, columnspan=2, sticky="w")
 
@@ -223,6 +229,15 @@ class App:
             e.grid(row=6 + i, column=2, sticky="w", pady=(14 if i == 0 else 2, 0))
         ttk.Label(f, text="Quality changes apply after Stop and On air.", style="Dim.TLabel").grid(
             row=9, column=1, columnspan=2, sticky="w", pady=(12, 0))
+
+        ttk.Label(f, text="Monitor").grid(row=10, column=0, sticky="w", pady=(14, 0))
+        self.v_mon_dev = tk.StringVar(value=self.s["monitor_device"] or "Default")
+        self.cb_mon = ttk.Combobox(f, textvariable=self.v_mon_dev, width=34, state="readonly",
+                                   values=["Default"] + rc.list_devices())
+        self.cb_mon.grid(row=10, column=1, columnspan=2, sticky="w", pady=(14, 0))
+        self.cb_mon.bind("<<ComboboxSelected>>", lambda e: self._monitor_device_changed())
+        ttk.Label(f, text="Headphones to hear what goes on air: MON on the display.", style="Dim.TLabel").grid(
+            row=11, column=1, columnspan=2, sticky="w")
         for v in (self.v_name, self.v_frame, self.v_ann_start, self.v_ann_every):
             v.trace_add("write", lambda *a: self._output_changed())
         return f
@@ -275,7 +290,9 @@ class App:
 
     def announce_now(self):
         self.radio.name = self.v_name.get().strip() or "radio-lxst"
-        self.radio.announce()
+        if not self.radio.announce():
+            self.log(f"Announce not sent: one every {rl.ANNOUNCE_MIN_GAP // 60} min at most, "
+                     f"next in {hms(self.radio.announce_wait())}")
 
     def copy_id(self):
         self.copied("Call ID", self.radio.identity_hash)
@@ -322,12 +339,41 @@ class App:
             self.v_folder.set(os.path.normpath(d))
             self.v_mode.set("folder")
 
+    # local monitor
+    def _monitor_device(self):
+        d = self.v_mon_dev.get()
+        return "" if d == "Default" else d
+
+    def toggle_monitor(self):
+        if self.radio.monitor:
+            self.radio.monitor.stop()
+            self.radio.monitor = None
+            self.log("Monitor off")
+            return
+        dev = self._monitor_device()
+        src = self.radio.source
+        if isinstance(src, rl.LineSource) and src.device.startswith("Loopback: "):
+            if src.device[len("Loopback: "):] == (dev or rl.default_output_name()):
+                self.log("Monitor not started: it would play into the same device the input records (feedback)")
+                return
+        mon = rc.Player(prefill=0.3, device=dev or None, max_extra=0.5)
+        mon.start()
+        self.radio.monitor = mon
+        self.log(f"Monitor on: {dev or 'default output'}")
+
+    def _monitor_device_changed(self):
+        self.save()
+        if self.radio.monitor:  # restart on the new device
+            self.toggle_monitor()
+            self.toggle_monitor()
+
     def _apply_announce(self):
         self.radio.announce_on_start = bool(self.s["announce_on_start"])
         try:
-            self.radio.announce_every_min = max(0, int(self.s["announce_every_min"]))
+            self.radio.announce_every_min = int(self.s["announce_every_min"])
         except (TypeError, ValueError):
             pass
+        self.s["announce_every_min"] = self.radio.announce_every_min
 
     def _mix_changed(self):
         g = round(float(self.v_gain.get()) * 2) / 2
@@ -351,11 +397,12 @@ class App:
             every = int(self.v_ann_every.get())
         except (ValueError, AttributeError):
             every = self.s["announce_every_min"]
+        every = max(rl.ANNOUNCE_MIN_EVERY, every) if every > 0 else 0
         try:
             self.s.update({
                 "name": self.v_name.get(), "mode": self.v_mode.get(), "url": self.v_url.get(),
                 "folder": self.v_folder.get(), "shuffle": self.v_shuffle.get(),
-                "input_device": self.v_input.get(),
+                "input_device": self.v_input.get(), "monitor_device": self._monitor_device(),
                 "frame_ms": int(self.v_frame.get()), "announce_on_start": self.v_ann_start.get(),
                 "announce_every_min": every, "auto_start": self.v_auto.get(),
                 "gain_db": self.radio.gain_db, "limiter_on": self.radio.limiter_on,
@@ -375,9 +422,12 @@ class App:
     def quit(self):
         self.save()
         try:
+            if self.radio.monitor:
+                self.radio.monitor.stop()
             self.radio.stop() if self.radio.on_air else None
         except Exception:
             pass
+        time.sleep(0.3)  # let audio threads leave WASAPI before exit
         self.root.destroy()
         os._exit(0)
 
@@ -410,10 +460,13 @@ class App:
                                            f"send late {snap['late_ms']:.0f} ms", fg=DIM)
             self.radio.max_late = 0.0
             on = snap["on_air"]
-            self.b_stop.state(["!disabled"] if on else ["disabled"])
+            self.b_stop.state(["!disabled"] if on or snap["waiting"] else ["disabled"])
             src = self.radio.source
             self.b_skip.state(["!disabled"] if on and src and src.folder else ["disabled"])
             self.b_switch.state(["!disabled"] if on else ["disabled"])
+            aw = snap["announce_wait"]
+            self.b_ann.configure(text=f"Announce in {hms(aw)}" if aw else "Announce now")
+            self.b_ann.state(["disabled"] if aw else ["!disabled"])
 
         try:
             while True:
@@ -431,7 +484,11 @@ class App:
 
         name = (self.radio.name or "radio-lxst")[:34]
         c.create_text(12, 18, text=name, anchor="w", fill=LCD if on else LCD_DIM, font=LCD_BIG)
-        draw_badge(c, w, "ON AIR" if on else "OFF AIR", on, (self.tick // 5) % 2 == 0)
+        blink = (self.tick // 5) % 2 == 0
+        if snap["waiting"]:
+            draw_badge(c, w, "STAMPS", True, blink, AMBER)
+        else:
+            draw_badge(c, w, "ON AIR" if on else "OFF AIR", on, blink)
 
         c.create_text(w - 180, 44, text=f"VOL {snap['gain_db']:+.1f}", anchor="w",
                       fill=LCD if on else LCD_DIM, font=LCD_FONT)
@@ -447,13 +504,20 @@ class App:
             f"CALL ID  {self.radio.identity_hash}",
             f"LISTEN   {snap['listeners']:<3} PEAK {snap['peak']:<3} SENT {RNS.prettysize(snap['bytes'])}",
             f"UPTIME   {hms(snap['uptime'])}   SRC {snap['source_state'].upper()}",
-            f"PLAYING  {snap['now_playing'][:46]}",
+            f"PLAYING  {snap['now_playing'][:46]}" if snap["stamps_ready"] else
+            f"STAMPS   preparing {snap['stamps_done']}/3" + (", on air when ready" if snap["waiting"] else
+                                                          ", first start only"),
         ]
         for i, t in enumerate(lines):
             c.create_text(12, 44 + i * 18, text=t, anchor="w", fill=LCD if on else LCD_DIM, font=LCD_FONT,
                           tags=("cid",) if i == 0 else ())
 
-        draw_vu(c, w, self.vu, on)
+        mon = self.radio.monitor is not None
+        # same size as the ON AIR badge
+        c.create_rectangle(w - 180, 84, w - 108, 104, outline=LCD if mon else LCD_DIM,
+                           fill=LCD if mon else LCD_BG, tags=("mon",))
+        c.create_text(w - 144, 94, text="MON", fill=LCD_BG if mon else LCD_DIM, font=LCD_BOLD, tags=("mon",))
+        draw_vu(c, w, self.vu, on, snap["ceiling_db"] if snap["limiter_on"] else None)
 
 
 def main():

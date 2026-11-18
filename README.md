@@ -2,7 +2,7 @@
 
 Internet radio over [Reticulum](https://reticulum.network). Put a web radio stream, a folder of music or a live sound card input on the air, and listeners tune in by **calling** the station, like a phone call, with [LXST](https://pypi.org/project/lxst/): from the radio-lxst client, Sideband or rnphone.
 
-Version 0.2 · [Reticulum License](LICENSE)
+Version 0.3 · [Reticulum License](LICENSE)
 
 | Server | Client |
 |---|---|
@@ -11,7 +11,7 @@ Version 0.2 · [Reticulum License](LICENSE)
 ## What it does
 
 - **Server**: plays an existing stream (Icecast, Shoutcast, Zeno, any http audio) a folder (shuffle, next track) or a live input (mic, line in, VB-Cable, an SDR app, Loopback of what the PC plays), with volume and limiter. Many listeners at once, each on its own encrypted Reticulum Link. Announces itself so clients can find it.
-- **Client**: list of the stations heard on the network, a steady 2 s buffer, volume, output device, and the station's name, listeners and track during the call.
+- **Client**: list of the stations heard on the network, a steady 3 s buffer, volume, output device, and the station's name, listeners and track during the call.
 - **Compatible**: any LXST phone (Sideband, rnphone) can listen too, it just calls the station's Call ID.
 
 ## Quickstart
@@ -67,13 +67,16 @@ On Linux use `python3`.
 
 Server:
 - **Input**: stream URL, folder or line input (pick the device from the list, **Refresh** after plugging one in). **Switch now** changes source on air, listeners stay connected.
-- **Output**: station name, quality, announce on air and every N minutes, go on air at start.
+- **Output**: station name, quality, announce on air and every N minutes (20 at least), go on air at start. One announce every 10 minutes at most, Announce now included.
 - **Listeners**: who is tuned in, quality, time, kbit/s.
 - Volume and limiter work live; the display shows how much the limiter pulls down.
+- **MON** on the display: hear what goes on air on this PC (choose the device in Output > Monitor).
+- Meters have a dB scale; the amber line is the limiter ceiling.
 
 Client:
 - Double click a station to listen. "Play last station at start" resumes on launch.
 - Buffer: more seconds = fewer dropouts on slow paths.
+- If the first path is stale the client drops it and asks for a fresh one, then gives up. If the station is lost while playing (no audio for 20 s) it redials after 15, 30, 60 and 120 s; a station that stops on purpose is not redialed.
 
 Line input, for example from an SDR program:
 - Send the SDR audio to **CABLE Input** (VB-Audio Virtual Cable) and choose **CABLE Output**, or
@@ -89,15 +92,28 @@ Addresses are copied with a click: the CALL ID line on the display, the addresse
 
 ## How it works
 
-- The station announces three destinations from one identity: `lxst.telephony` (the number to call), `lxmf.delivery` (its name in Sideband) and `radiolxst.station` (name, listeners, track, on/off air, for the client list).
+- The station announces three destinations from one identity: `lxst.telephony` (the number to call), `lxmf.delivery` (its name in Sideband) and `radiolxst.station` (name, listeners, track or "Live streaming" for streams and live input, on/off air, for the client list).
 - ffmpeg decodes stream and files, the sound card input is read directly; radio-lxst encodes Opus once per quality in use and sends the same frames to every listener on that quality.
 - The quality follows the caller's profile: Opus stereo 48 kHz for HQ/SHQ, stereo 24 kHz for MQ, mono for the low bandwidth profiles.
+- With RNS 1.6.1 or newer every announce carries a stamp. On the first start of a new station they take a few minutes (the display shows STAMPS n/3), the station goes on air by itself when they are ready; later starts reuse them from disk.
 - **Steady** (default): 120 ms packets, about 28 kbit/s per listener. **High**: 60 ms packets, up to 56 kbit/s. Meant for internet links (TCP, I2P), not LoRa.
 - During the call the station also sends name, listeners and track in a msgpack key (`"radiolxst"`). LXST only reads the signalling and audio keys, so other phones ignore it.
 - The caller's microphone is ignored.
 
 ## Changes
 
+- 0.3: Added MON local monitor.
+- 0.3: Added dB scale and ceiling line on meters.
+- 0.3: Added stamp preparation before going on air.
+- 0.3: Announce every 60 min by default.
+- 0.3: Announce limits: periodic 20 min min, any 10 min min.
+- 0.3: Client buffer 3 s by default.
+- 0.3: Client retries a stale path.
+- 0.3: Client redials after a drop.
+- 0.3: Fixed audio crashes on Windows.
+- 0.3: Fixed crash when switching stations.
+- 0.3: "Live streaming" for streams and line input.
+- 0.3: Client log file in storage.
 - 0.2: Added line input source (mic, sound card, VB-Cable, loopback).
 - 0.1: First release.
 
@@ -105,7 +121,7 @@ Addresses are copied with a click: the CALL ID line on the display, the addresse
 
 `radio_lxst.py` server engine and CLI, `radio_gui.py` server window, `radio_client.py` client engine and CLI, `radio_client_gui.py` client window, `ui_common.py` shared look.
 
-Settings are saved next to the scripts (`settings.json`, `client_settings.json`), identities and the station list in `storage/`. Run one server per identity.
+Settings are saved next to the scripts (`settings.json`, `client_settings.json`), identities and the station list in `storage/`. The client GUI also writes `storage/client.log` (and `client_crash.log` if it ever crashes). Run one server per identity.
 
 ## Responsible use
 
