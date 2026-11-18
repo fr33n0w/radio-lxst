@@ -24,7 +24,7 @@ except Exception:
 from LXST.Codecs import Opus
 from LXST.Codecs.libs.pyogg import opus, OpusEncoder
 
-__version__ = "0.1"
+__version__ = "0.2"
 
 APP_NAME = "lxst"
 ASPECT = "telephony"
@@ -219,6 +219,110 @@ class Source:
                 pass
 
 
+LIVE_MAX_FRAMES = 4  # live input: drop old frames past this, keeps latency low
+
+
+def _soundcard():
+    if sys.platform == "win32":
+        from LXST.Platforms.windows import soundcard
+        soundcard._com.init_com()  # COM is per thread on Windows
+    elif sys.platform == "darwin":
+        from LXST.Platforms.darwin import soundcard
+    else:
+        from LXST.Platforms.linux import soundcard
+    return soundcard
+
+
+def _device_label(dev):
+    return ("Loopback: " if getattr(dev, "isloopback", False) else "") + dev.name
+
+
+def list_inputs():
+    """Input device labels (mics, line in, virtual cables, loopback of outputs), read in a worker thread."""
+    out = []
+
+    def job():
+        try:
+            out.extend(_device_label(d) for d in _soundcard().all_microphones(include_loopback=True))
+        except Exception as e:
+            RNS.log(f"Could not list input devices: {e}", RNS.LOG_WARNING)
+
+    t = threading.Thread(target=job, daemon=True)
+    t.start()
+    t.join(5)
+    return out
+
+
+class LineSource:
+    """Live sound card input (mic, line in, VB-Cable, loopback) -> 48 kHz stereo PCM frames."""
+
+    url = folder = None
+
+    def __init__(self, device):
+        self.device = device
+        self.frames = deque(maxlen=MAX_QUEUE_FRAMES)
+        self.now_playing = device
+        self.state = "starting"
+        self.running = True
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _open(self):
+        sc = _soundcard()
+        devs = sc.all_microphones(include_loopback=True)
+        for d in devs:
+            if _device_label(d) == self.device:
+                return d
+        low = self.device.lower()
+        for d in devs:
+            if low in _device_label(d).lower():
+                return d
+        return None
+
+    def _loop(self):
+        while self.running:
+            dev = None
+            try:
+                dev = self._open()
+            except Exception as e:
+                RNS.log(f"Input error: {e}", RNS.LOG_ERROR)
+            if dev is None:
+                self.state = "input device not found"
+                RNS.log(f"Input device not found: {self.device}", RNS.LOG_ERROR)
+                time.sleep(5)
+                continue
+            try:
+                ch = max(1, int(dev.channels))
+                with dev.recorder(samplerate=SAMPLE_RATE, channels=min(ch, CHANNELS),
+                                  blocksize=FRAME_SAMPLES // 4) as rec:
+                    self.state = "live"
+                    while self.running:
+                        x = np.asarray(rec.record(numframes=FRAME_SAMPLES), dtype=np.float32)
+                        if x.ndim == 1:
+                            x = x[:, None]
+                        if x.shape[0] != FRAME_SAMPLES:
+                            continue
+                        if x.shape[1] == 1:
+                            x = np.repeat(x, 2, axis=1)
+                        pcm = (np.clip(x[:, :2], -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+                        while len(self.frames) >= LIVE_MAX_FRAMES:
+                            self.frames.popleft()
+                        self.frames.append(pcm)
+            except Exception as e:
+                RNS.log(f"Input error on {self.device}: {e}", RNS.LOG_ERROR)
+                self.state = "input error, retrying"
+                time.sleep(3)
+
+    def skip(self):
+        pass
+
+    def stop(self):
+        self.running = False
+
+
+def source_label(src):
+    return src.url or src.folder or getattr(src, "device", "") or "?"
+
+
 class Listener:
     def __init__(self, link):
         self.link = link
@@ -290,7 +394,7 @@ class Radio:
         self.source = source
         if old:
             old.stop()
-        RNS.log(f"Source switched to {source.url or source.folder}", RNS.LOG_NOTICE)
+        RNS.log(f"Source switched to {source_label(source)}", RNS.LOG_NOTICE)
 
     def stop(self):
         was_on = self.on_air
@@ -550,6 +654,8 @@ def main():
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--url", help="existing stream (http/https, Icecast, Shoutcast...)")
     g.add_argument("--folder", help="folder of audio files, played in a loop")
+    g.add_argument("--input", metavar="DEVICE", help="live sound card input: mic, line in, VB-Cable, 'Loopback: ...' (name or part of it)")
+    g.add_argument("--list-inputs", action="store_true", help="list the input devices and exit")
     ap.add_argument("--shuffle", action="store_true", help="shuffle the folder playlist")
     ap.add_argument("--name", default="radio-lxst", help="station name in the announce")
     ap.add_argument("--identity", default=os.path.join(here, "storage", "identity"))
@@ -563,6 +669,9 @@ def main():
     ap.add_argument("--status", type=int, default=15, help="seconds between status lines")
     ap.add_argument("-v", "--verbose", action="count", default=0)
     a = ap.parse_args()
+    if a.list_inputs:
+        print("\n".join(list_inputs()) or "no input devices found")
+        return
     set_frame_ms(a.frame_ms)
 
     RNS.Reticulum(configdir=a.rnsconfig, loglevel=RNS.LOG_NOTICE + a.verbose)
@@ -571,12 +680,12 @@ def main():
     radio.gain_db = max(-24.0, min(12.0, a.gain))
     radio.limiter_on = not a.no_limiter
     radio.limiter.ceiling_db = min(0.0, a.ceiling)
-    radio.start(Source(url=a.url, folder=a.folder, shuffle=a.shuffle))
+    radio.start(LineSource(a.input) if a.input else Source(url=a.url, folder=a.folder, shuffle=a.shuffle))
 
     print(f"\n  {a.name}  on air")
     print(f"  Call this identity from Sideband / rnphone:  {radio.identity_hash}")
     print(f"  LXST destination: {radio.dest.hash.hex()}   LXMF: {radio.lxmf.hash.hex()}")
-    print(f"  Source: {a.url or a.folder}\n")
+    print(f"  Source: {a.url or a.folder or a.input}\n")
     try:
         while True:
             time.sleep(a.status)

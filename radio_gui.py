@@ -17,7 +17,7 @@ from ui_common import (BG, EDGE, LCD_BG, DIM, LCD, LCD_DIM, AMBER, UI_FONT, TITL
 HERE = os.path.dirname(os.path.abspath(__file__))
 SETTINGS = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.path.join(HERE, "settings.json")
 DEFAULTS = {
-    "name": "radio-lxst", "mode": "url", "url": "", "folder": "", "shuffle": False,
+    "name": "radio-lxst", "mode": "url", "url": "", "folder": "", "shuffle": False, "input_device": "",
     "frame_ms": 120, "announce_on_start": True, "announce_every_min": 15,
     "identity": os.path.join(HERE, "storage", "identity"), "rnsconfig": "", "auto_start": False,
     "gain_db": 0.0, "limiter_on": True, "limiter_ceiling_db": -2.0,
@@ -142,6 +142,7 @@ class App:
         self.v_url = tk.StringVar(value=self.s["url"])
         self.v_folder = tk.StringVar(value=self.s["folder"])
         self.v_shuffle = tk.BooleanVar(value=self.s["shuffle"])
+        self.v_input = tk.StringVar(value=self.s["input_device"])
 
         ttk.Radiobutton(f, text="Existing stream (Icecast, Shoutcast, Zeno, any http audio)",
                         variable=self.v_mode, value="url").grid(row=0, column=0, columnspan=3, sticky="w")
@@ -156,16 +157,24 @@ class App:
                                                                            padx=(20, 0), pady=4)
         self.b_skip = ttk.Button(f, text="Next track", command=self.skip)
         self.b_skip.grid(row=4, column=1, sticky="w", pady=4)
+        ttk.Radiobutton(f, text="Line input (mic, sound card, VB-Cable, SDR app, Loopback = what the PC plays)",
+                        variable=self.v_mode, value="line").grid(row=5, column=0, columnspan=3, sticky="w",
+                                                                   pady=(12, 0))
+        self.cb_input = ttk.Combobox(f, textvariable=self.v_input, width=50, state="readonly")
+        self.cb_input.grid(row=6, column=0, columnspan=2, sticky="we", padx=(20, 6), pady=2)
+        self.cb_input.bind("<<ComboboxSelected>>", lambda e: self.v_mode.set("line"))
+        ttk.Button(f, text="Refresh", command=self.refresh_inputs).grid(row=6, column=2, sticky="w")
         self.in_info = ttk.Label(f, text="", style="Dim.TLabel")
-        self.in_info.grid(row=5, column=0, columnspan=3, sticky="w", pady=(14, 0))
+        self.in_info.grid(row=7, column=0, columnspan=3, sticky="w", pady=(14, 0))
         row = ttk.Frame(f)
-        row.grid(row=6, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        row.grid(row=8, column=0, columnspan=3, sticky="w", pady=(10, 0))
         self.b_switch = ttk.Button(row, text="Switch now", style="Air.TButton", command=self.switch_source)
         self.b_switch.pack(side="left")
         ttk.Label(row, text="  changes the source on air, listeners stay connected", style="Dim.TLabel").pack(
             side="left")
         f.columnconfigure(1, weight=1)
-        for v in (self.v_mode, self.v_url, self.v_folder, self.v_shuffle):
+        self.refresh_inputs()
+        for v in (self.v_mode, self.v_url, self.v_folder, self.v_shuffle, self.v_input):
             v.trace_add("write", lambda *a: self.save())
         return f
 
@@ -231,6 +240,12 @@ class App:
                 self.log("Set a stream URL in Input first")
                 return None
             return rl.Source(url=url)
+        if self.v_mode.get() == "line":
+            dev = self.v_input.get().strip()
+            if not dev:
+                self.log("Choose an input device in Input first")
+                return None
+            return rl.LineSource(dev)
         folder = self.v_folder.get().strip()
         if not os.path.isdir(folder):
             self.log("Choose an existing folder in Input first")
@@ -294,6 +309,13 @@ class App:
         if self.radio.source and self.radio.source.folder:
             self.radio.source.skip()
 
+    def refresh_inputs(self):
+        devs = rl.list_inputs()
+        cur = self.v_input.get()
+        if cur and cur not in devs:
+            devs.append(cur)  # keep the saved one even if unplugged now
+        self.cb_input["values"] = devs
+
     def browse(self):
         d = filedialog.askdirectory(initialdir=self.v_folder.get() or HERE)
         if d:
@@ -333,6 +355,7 @@ class App:
             self.s.update({
                 "name": self.v_name.get(), "mode": self.v_mode.get(), "url": self.v_url.get(),
                 "folder": self.v_folder.get(), "shuffle": self.v_shuffle.get(),
+                "input_device": self.v_input.get(),
                 "frame_ms": int(self.v_frame.get()), "announce_on_start": self.v_ann_start.get(),
                 "announce_every_min": every, "auto_start": self.v_auto.get(),
                 "gain_db": self.radio.gain_db, "limiter_on": self.radio.limiter_on,

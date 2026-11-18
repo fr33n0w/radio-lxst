@@ -21,7 +21,7 @@ except Exception:
 
 from LXST.Codecs import Opus
 
-__version__ = "0.1"
+__version__ = "0.2"
 
 STATION_ASPECT = "radiolxst.station"
 FIELD_SIGNALLING = 0x00

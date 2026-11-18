@@ -1,8 +1,8 @@
 # radio-lxst
 
-Internet radio over [Reticulum](https://reticulum.network). Put a web radio stream or a folder of music on the air, and listeners tune in by **calling** the station, like a phone call, with [LXST](https://pypi.org/project/lxst/): from the radio-lxst client, Sideband or rnphone.
+Internet radio over [Reticulum](https://reticulum.network). Put a web radio stream, a folder of music or a live sound card input on the air, and listeners tune in by **calling** the station, like a phone call, with [LXST](https://pypi.org/project/lxst/): from the radio-lxst client, Sideband or rnphone.
 
-Version 0.1 · [Reticulum License](LICENSE)
+Version 0.2 · [Reticulum License](LICENSE)
 
 | Server | Client |
 |---|---|
@@ -10,7 +10,7 @@ Version 0.1 · [Reticulum License](LICENSE)
 
 ## What it does
 
-- **Server**: plays an existing stream (Icecast, Shoutcast, Zeno, any http audio) or a folder (shuffle, next track), with volume and limiter. Many listeners at once, each on its own encrypted Reticulum Link. Announces itself so clients can find it.
+- **Server**: plays an existing stream (Icecast, Shoutcast, Zeno, any http audio) a folder (shuffle, next track) or a live input (mic, line in, VB-Cable, an SDR app, Loopback of what the PC plays), with volume and limiter. Many listeners at once, each on its own encrypted Reticulum Link. Announces itself so clients can find it.
 - **Client**: list of the stations heard on the network, a steady 2 s buffer, volume, output device, and the station's name, listeners and track during the call.
 - **Compatible**: any LXST phone (Sideband, rnphone) can listen too, it just calls the station's Call ID.
 
@@ -46,6 +46,8 @@ Server (also fine on a headless box):
 ```
 python radio_lxst.py --url https://example.com/live.mp3 --name "My Radio"
 python radio_lxst.py --folder ~/music --shuffle --name "My Radio"
+python radio_lxst.py --list-inputs
+python radio_lxst.py --input "CABLE Output" --name "My Radio"
 ```
 
 Options: `--announce-every MIN`, `--gain DB`, `--ceiling DBFS`, `--no-limiter`, `--frame-ms 60|120`, `--identity FILE`, `--rnsconfig DIR`.
@@ -64,7 +66,7 @@ On Linux use `python3`.
 ## Using the GUIs
 
 Server:
-- **Input**: stream URL or folder. **Switch now** changes source on air, listeners stay connected.
+- **Input**: stream URL, folder or line input (pick the device from the list, **Refresh** after plugging one in). **Switch now** changes source on air, listeners stay connected.
 - **Output**: station name, quality, announce on air and every N minutes, go on air at start.
 - **Listeners**: who is tuned in, quality, time, kbit/s.
 - Volume and limiter work live; the display shows how much the limiter pulls down.
@@ -72,6 +74,11 @@ Server:
 Client:
 - Double click a station to listen. "Play last station at start" resumes on launch.
 - Buffer: more seconds = fewer dropouts on slow paths.
+
+Line input, for example from an SDR program:
+- Send the SDR audio to **CABLE Input** (VB-Audio Virtual Cable) and choose **CABLE Output**, or
+- leave it on the speakers and choose **Loopback: <your speakers>**: everything the PC plays goes on air.
+- On Linux the PulseAudio/PipeWire monitor sources work as loopback.
 
 Addresses are copied with a click: the CALL ID line on the display, the addresses in Output, right click on a station or a listener.
 
@@ -83,11 +90,16 @@ Addresses are copied with a click: the CALL ID line on the display, the addresse
 ## How it works
 
 - The station announces three destinations from one identity: `lxst.telephony` (the number to call), `lxmf.delivery` (its name in Sideband) and `radiolxst.station` (name, listeners, track, on/off air, for the client list).
-- ffmpeg decodes the source, radio-lxst encodes Opus once per quality in use and sends the same frames to every listener on that quality.
+- ffmpeg decodes stream and files, the sound card input is read directly; radio-lxst encodes Opus once per quality in use and sends the same frames to every listener on that quality.
 - The quality follows the caller's profile: Opus stereo 48 kHz for HQ/SHQ, stereo 24 kHz for MQ, mono for the low bandwidth profiles.
 - **Steady** (default): 120 ms packets, about 28 kbit/s per listener. **High**: 60 ms packets, up to 56 kbit/s. Meant for internet links (TCP, I2P), not LoRa.
 - During the call the station also sends name, listeners and track in a msgpack key (`"radiolxst"`). LXST only reads the signalling and audio keys, so other phones ignore it.
 - The caller's microphone is ignored.
+
+## Changes
+
+- 0.2: Added line input source (mic, sound card, VB-Cable, loopback).
+- 0.1: First release.
 
 ## Files
 
