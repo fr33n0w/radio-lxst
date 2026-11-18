@@ -1,0 +1,6 @@
+storage/
+settings.json
+client_settings.json
+__pycache__/
+*.wav
+*.log
