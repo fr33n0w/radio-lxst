@@ -458,6 +458,10 @@ class App:
         if self.tick % 8 == 0 or self.dir_dirty:
             self.dir_dirty = False
             st = self.dir.stations.get(snap["call_id"])
+            if st is None and snap["state"] == "playing" and snap["listeners"] is not None:
+                # tuned in by Call ID before hearing its announce: it goes in the list too
+                st = self.dir.stations[snap["call_id"]] = rc.Station(snap["call_id"], snap["name"])
+                self.dir.save()
             if st and snap["state"] == "playing" and snap["listeners"] is not None:
                 # keep the list in step with what the station tells us in the call
                 st.name = snap["name"] or st.name

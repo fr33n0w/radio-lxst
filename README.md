@@ -7,6 +7,7 @@ Version 0.4 · [Reticulum License](LICENSE)
 | Server | Client |
 |---|---|
 | ![server](screenshots/server.png) | ![client](screenshots/client.png) |
+| ![station replies](screenshots/server_replies.png) | ![client commands](screenshots/client_commands.png) |
 
 ## What it does
 

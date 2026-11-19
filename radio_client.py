@@ -712,7 +712,7 @@ class Client:
 def load_identity(path):
     if os.path.isfile(path):
         return RNS.Identity.from_file(path)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)  # a bare file name too
     ident = RNS.Identity()
     ident.to_file(path)
     return ident
