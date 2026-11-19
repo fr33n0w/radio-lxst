@@ -6,19 +6,22 @@ import sys
 import json
 import time
 import queue
+import threading
 import faulthandler
 import tkinter as tk
 from tkinter import ttk
 
 import RNS
 import radio_client as rc
-from ui_common import (BG, LCD, LCD_DIM, AMBER, RED, DIM, UI_FONT, TITLE_FONT, LCD_FONT, LCD_BIG, hms,
+import client_lxmf
+from ui_common import (BG, LCD, LCD_DIM, LCD_BG, AMBER, RED, DIM, UI_FONT, TITLE_FONT, LCD_FONT, LCD_BIG, LOG_FONT, LCD_BOLD, hms,
                        apply_style, volume_scale, draw_vu, draw_badge, LogBox, copy_text, context_menu, hash_of)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SETTINGS = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.path.join(HERE, "client_settings.json")
 DEFAULTS = {"call_id": "", "quality": "SHQ", "volume_db": 0.0, "buffer_s": 3.0, "device": "",
-            "identity": os.path.join(HERE, "storage", "client_identity"), "rnsconfig": "", "autoplay": False}
+            "identity": os.path.join(HERE, "storage", "client_identity"), "rnsconfig": "", "autoplay": False,
+            "nick": ""}
 BADGES = {"playing": ("PLAYING", LCD), "buffering": ("BUFFER", AMBER), "searching": ("SEARCH", AMBER),
           "retrying": ("RETRY", AMBER),
           "connecting": ("CONNECT", AMBER), "ringing": ("RINGING", AMBER), "failed": ("FAILED", RED),
@@ -85,7 +88,13 @@ class App:
         self.dir = rc.Directory(os.path.join(HERE, "storage", "stations.json"))
         self.dir.on_change = lambda: setattr(self, "dir_dirty", True)
         self.client = rc.Client(rc.load_identity(self.s["identity"]), float(self.s["buffer_s"]),
-                                self.s["device"] or None)
+                                self.s["device"] or None, nick=self.s.get("nick", ""))
+        self.cmds = None
+        self.cmds_wait = "preparing the LXMF address..."
+        self.stamping = False
+        self.cmds_go = False
+        self.notices = queue.Queue()
+        threading.Thread(target=self._start_cmds, daemon=True).start()
 
         self._build()
         root.protocol("WM_DELETE_WINDOW", self.quit)
@@ -100,6 +109,10 @@ class App:
         top.pack(fill="x", padx=8, pady=(8, 0))
         tk.Label(top, text="radio-lxst", bg=BG, fg=LCD, font=TITLE_FONT).pack(side="left")
         tk.Label(top, text="  client", bg=BG, fg=DIM, font=UI_FONT).pack(side="left")
+        # our name for the stations (sent in the call); empty = Radio-LXST Client #xxxx
+        self.v_nick = tk.StringVar(value=self.s.get("nick", ""))
+        ttk.Entry(top, textvariable=self.v_nick, width=22).pack(side="right")
+        tk.Label(top, text="Your name", bg=BG, fg=DIM, font=UI_FONT).pack(side="right", padx=(0, 4))
 
         lcd_wrap = tk.Frame(r, bg="#4b4b5c", padx=2, pady=2)
         lcd_wrap.pack(fill="x", padx=8, pady=6)
@@ -135,13 +148,15 @@ class App:
         self.v_dev = tk.StringVar(value=self.s["device"] or "default")
         ttk.Combobox(mix, textvariable=self.v_dev, values=self._devices(), width=18,
                      state="readonly").pack(side="left", padx=4)
-        for v in (self.v_vol, self.v_buf, self.v_dev, self.v_quality, self.v_call):
+        for v in (self.v_vol, self.v_buf, self.v_dev, self.v_quality, self.v_call, self.v_nick):
             v.trace_add("write", lambda *a: self._changed())
         self._changed()
 
         nb = ttk.Notebook(r)
         nb.pack(fill="both", expand=True, padx=8, pady=8)
         nb.add(self._tab_stations(nb), text="Stations")
+        nb.add(self._tab_commands(nb), text="Commands")
+        nb.bind("<<NotebookTabChanged>>", lambda ev: nb.index("current") == 1 and self._cmd_pick_current())
         f = ttk.Frame(nb, padding=4)
         self.logbox = LogBox(f)
         nb.add(f, text="Log")
@@ -155,9 +170,9 @@ class App:
 
     def _tab_stations(self, nb):
         f = ttk.Frame(nb, padding=6)
-        cols = ("name", "air", "lst", "np", "cid", "hops", "heard")
+        cols = ("name", "air", "sub", "lst", "np", "cid", "hops", "heard")
         self.tree = ttk.Treeview(f, columns=cols, show="headings", height=8)
-        for c, t, w in (("name", "Station", 160), ("air", "", 34), ("lst", "Listeners", 75),
+        for c, t, w in (("name", "Station", 160), ("air", "", 34), ("sub", "Sub", 36), ("lst", "Listeners", 75),
                         ("np", "Now playing", 95), ("cid", "Call ID", 255), ("hops", "Hops", 40), ("heard", "Heard", 54)):
             self.tree.heading(c, text=t)
             self.tree.column(c, width=w, anchor="e" if c in ("lst", "hops") else "w")
@@ -170,10 +185,157 @@ class App:
         ttk.Button(row, text="Listen", command=lambda: self._tune_selected("Listen button")).pack(side="left")
         ttk.Button(row, text="Copy Call ID", command=self._copy_selected).pack(side="left", padx=6)
         ttk.Button(row, text="Forget", command=self._forget_selected).pack(side="left")
+        ttk.Button(row, text="Refresh", command=lambda: self.dir.refresh(self._playing_cid())).pack(side="left", padx=6)
         self.v_auto = tk.BooleanVar(value=bool(self.s.get("autoplay")))
         ttk.Checkbutton(row, text="Play last station at start", variable=self.v_auto).pack(side="right")
         self.v_auto.trace_add("write", lambda *a: self._changed())
         return f
+
+    def _tab_commands(self, nb):
+        # station autoresponder commands over LXMF, no free text
+        f = ttk.Frame(nb, padding=6)
+        row = ttk.Frame(f)
+        row.pack(fill="x")
+        tk.Label(row, text="Station", bg=BG, fg=DIM, font=UI_FONT).pack(side="left")
+        self.v_cmd_st = tk.StringVar()
+        self.cmd_box = ttk.Combobox(row, textvariable=self.v_cmd_st, width=70, state="readonly")
+        self.cmd_box.pack(side="left", padx=6, fill="x", expand=True)
+        self.v_cmd_st.trace_add("write", lambda *a: setattr(self, "cmd_shown", None))
+        btns = ttk.Frame(f)
+        btns.pack(fill="x", pady=(6, 4))
+        self.cmd_btns = []
+        for c in client_lxmf.COMMANDS:
+            b = ttk.Button(btns, text=c.capitalize(), command=lambda c=c: self._send_cmd(c), state="disabled")
+            b.pack(side="left", padx=(0, 4))
+            self.cmd_btns.append(b)
+        self.cmd_btns_on = False
+        ttk.Button(btns, text="Clear", command=self._clear_cmds).pack(side="right")
+        wrap = ttk.Frame(f)
+        wrap.pack(fill="both", expand=True)
+        self.cmd_text = tk.Text(wrap, bg=LCD_BG, fg=LCD, font=LOG_FONT, relief="flat", wrap="word", height=8)
+        sb = ttk.Scrollbar(wrap, command=self.cmd_text.yview)
+        self.cmd_text.configure(yscrollcommand=sb.set, state="disabled")
+        sb.pack(side="right", fill="y")
+        self.cmd_text.pack(fill="both", expand=True)
+        self.cmd_text.tag_configure("out", foreground=AMBER)
+        self.cmd_text.tag_configure("dim", foreground=DIM)
+        self.cmd_text.tag_configure("bad", foreground=RED)
+        self.cmd_addr = tk.Label(f, text="", bg=BG, fg=DIM, font=UI_FONT, anchor="w", cursor="hand2")
+        self.cmd_addr.pack(fill="x", pady=(4, 0))
+        self.cmd_sub = tk.Label(btns, text="", bg=BG, fg=DIM, font=UI_FONT)
+        self.cmd_sub.pack(side="right", padx=8)
+        self.cmd_addr.bind("<Button-1>", lambda ev: self.cmds and self.copied("LXMF address", self.cmds.address))
+        self.cmd_shown = None
+        self.cmd_ids = {}
+        return f
+
+    def _start_cmds(self):
+        # our LXMF address goes up only with its announce stamp made (in a child process, first start only)
+        try:
+            if not client_lxmf.load_ready(self.client.identity):
+                self.stamping = True
+                self.cmds_wait = ("making the announce stamp of your LXMF address: first start only, "
+                                  "a few minutes in the background")
+            ok = client_lxmf.ensure_stamp(self.client.identity)
+            self.stamping = False
+            if not ok:
+                self.cmds_wait = "could not make the announce stamp, commands are off (see Log)"
+                return
+            self.cmds_go = True  # the router is made by _update: LXMRouter sets signal handlers, main thread only
+        except Exception as e:
+            self.cmds_wait = f"commands are off: {e}"
+            RNS.log(f"LXMF commands off: {e}", RNS.LOG_ERROR)
+
+    def _make_cmds(self):
+        self.cmds_go = False
+        try:
+            self.cmds = client_lxmf.Commands(self.client.identity, os.path.join(HERE, "storage"),
+                                             self.client.listener_name, self.dir)
+            self.cmds.on_notice = lambda cid, text: self.notices.put((cid, text))
+        except Exception as e:
+            self.cmds_wait = f"commands are off: {e}"
+            RNS.log(f"LXMF commands off: {e}", RNS.LOG_ERROR)
+
+    def _cmd_station(self):
+        """Call ID of the station picked (the list shows its LXMF address, the one that gets the messages)."""
+        v = self.v_cmd_st.get()
+        return self.cmd_ids.get(v.rsplit(" ", 1)[-1], "") if v else ""
+
+    def _cmd_choices(self):
+        rows = [(st.name or "?", st.call_id) for st in
+                sorted(list(self.dir.stations.values()), key=lambda s: (not s.on_air, -s.heard))]
+        cid = self.v_call.get().strip().lower()
+        if len(cid) == 32 and cid not in self.dir.stations and all(ch in "0123456789abcdef" for ch in cid):
+            rows.append(("?", cid))
+        out = []
+        for name, c in rows:
+            lx = hash_of("lxmf.delivery", c)
+            self.cmd_ids[lx] = c
+            out.append(f"{name}  LXMF {lx}")
+        return out
+
+    def _cmd_pick_current(self):
+        """Opening the tab: the station of the Call ID field (the one playing or picked last)."""
+        self.cmd_box.configure(values=self._cmd_choices())
+        cid = self.v_call.get().strip().lower()
+        lx = next((k for k, v in self.cmd_ids.items() if v == cid), "")
+        for v in self.cmd_box.cget("values"):
+            if lx and v.endswith(" " + lx):
+                self.v_cmd_st.set(v)
+                return
+        if not self.v_cmd_st.get() and self.cmd_box.cget("values"):
+            self.v_cmd_st.set(self.cmd_box.cget("values")[0])
+
+    def _send_cmd(self, cmd):
+        cid = self._cmd_station()
+        if not self.cmds:
+            return self.log(f"Commands not ready: {self.cmds_wait}")
+        if len(cid) != 32:
+            return self.log("Pick a station first")
+        self.cmds.set_name(self.client.listener_name)
+        self.cmds.send(cid, cmd)
+
+    def _clear_cmds(self):
+        cid = self._cmd_station()
+        if self.cmds and cid:
+            self.cmds.clear(cid)
+
+    def _draw_cmds(self):
+        cid = self._cmd_station()
+        key = (cid, self.cmds.revision) if self.cmds else ("wait", self.cmds_wait)
+        if key == self.cmd_shown:
+            return
+        self.cmd_shown = key
+        t = self.cmd_text
+        t.configure(state="normal")
+        t.delete("1.0", "end")
+        if not self.cmds:
+            t.insert("end", f"Commands: {self.cmds_wait}\n", "dim")
+            t.configure(state="disabled")
+            return
+        rows = self.cmds.transcript(cid) if cid else []
+        if not rows:
+            t.insert("end", "Send a command to the station: the reply shows here.\n"
+                            "Subscribe = a message when it goes on air (while this client is open).\n", "dim")
+        for r in rows:
+            when = time.strftime("%d/%m %H:%M", time.localtime(r["t"]))
+            if r["dir"] == "out":
+                st = r.get("state", "")
+                t.insert("end", f"{when}  > {r['text']}", "out")
+                t.insert("end", f"   {st}\n", "bad" if st.startswith("failed") else "dim")
+            else:
+                t.insert("end", f"{when}  ", "dim")
+                t.insert("end", r["text"] + "\n\n")
+        t.see("end")
+        t.configure(state="disabled")
+        sub = self.cmds.subscribed(cid) if cid else None
+        # what the station said to our last subscribe/unsubscribe
+        self.cmd_sub.configure(text={True: "✓ Subscribed", False: "Not subscribed"}.get(sub, ""),
+                               fg=LCD if sub else DIM)
+
+    def _playing_cid(self):
+        # the station we listen to tells its state inside the call: no status request for it
+        return {self.client.call_id} if self.client.call_id and self.client.state == "playing" else set()
 
     def _station_menu(self, ev):
         cid = self.tree.identify_row(ev.y)
@@ -251,7 +413,9 @@ class App:
         self.vol_lbl.configure(text=f"{g:+.1f} dB")
         self.s.update({"call_id": self.v_call.get().strip(), "quality": self.v_quality.get(), "volume_db": g,
                        "buffer_s": self._buf(), "device": "" if self.v_dev.get() == "default" else self.v_dev.get(),
-                       "autoplay": self.v_auto.get() if hasattr(self, "v_auto") else bool(self.s.get("autoplay"))})
+                       "autoplay": self.v_auto.get() if hasattr(self, "v_auto") else bool(self.s.get("autoplay")),
+                       "nick": self.v_nick.get().strip()[:32]})
+        self.client.set_nick(self.s["nick"])
         try:
             with open(SETTINGS, "w", encoding="utf-8") as f:
                 json.dump(self.s, f, indent=2)
@@ -289,6 +453,8 @@ class App:
             self.vu[i] = lv if lv > self.vu[i] else self.vu[i] * 0.8
         self._draw_lcd()
 
+        if self.tick % 8 == 0:
+            self.dir.poll(self._playing_cid())
         if self.tick % 8 == 0 or self.dir_dirty:
             self.dir_dirty = False
             st = self.dir.stations.get(snap["call_id"])
@@ -296,21 +462,48 @@ class App:
                 # keep the list in step with what the station tells us in the call
                 st.name = snap["name"] or st.name
                 st.listeners, st.now_playing, st.heard = snap["listeners"], snap["track"], time.time()
+                st.on_air, st.slots = True, snap["slots"]
+            elif st and (snap["state"] == "ended" or snap["message"] == "station off air"):
+                self.dir.mark_off(st.call_id)
             sel = self.tree.selection()
             self.tree.delete(*self.tree.get_children())
             for st in sorted(list(self.dir.stations.values()), key=lambda s: (not s.on_air, -s.heard)):
                 hops = st.hops
                 self.tree.insert("", "end", iid=st.call_id, values=(
-                    st.name or "?", "ON" if st.on_air else "off",
-                    st.listeners if st.listeners is not None else "", st.now_playing, st.call_id,
+                    st.name or "?", "ON" if st.on_air else "off", "✓" if self.cmds and self.cmds.subscribed(st.call_id) else "",
+                    st.listeners_text, st.now_playing, st.call_id,
                     hops if hops is not None else "", ago(st.heard)))
             for cid in sel:
                 if self.tree.exists(cid):
                     self.tree.selection_add(cid)
+            self.cmd_box.configure(values=self._cmd_choices())
+            self.cmd_addr.configure(text=f"Commands go from your LXMF address {self.cmds.address}  (click to copy)"
+                                    if self.cmds else f"Commands: {self.cmds_wait}",
+                                    fg=DIM if self.cmds else AMBER)
             if time.time() > self.flash[1]:
                 self.status.configure(text=f"Reticulum ok   stations {len(self.dir.stations)}   "
                                            f"client {self.client.identity.hash.hex()}", fg=DIM)
 
+        if self.cmds_go:
+            self._make_cmds()
+        try:
+            while True:
+                # a station we subscribed to tells it is on air: shown for a while in the status bar and the log
+                cid, text = self.notices.get_nowait()
+                name = self.dir.name_of(cid) or cid
+                line = f"📻 {name}: {' '.join(text.split())}"
+                self.log(line)
+                self.flash = (line[:120], time.time() + 30)
+                self.status.configure(text=self.flash[0], fg=AMBER)
+                self.dir_dirty = True
+        except queue.Empty:
+            pass
+        self._draw_cmds()
+        if bool(self.cmds) != self.cmd_btns_on:
+            # grey until our LXMF address is up (its announce stamp made)
+            self.cmd_btns_on = bool(self.cmds)
+            for b in self.cmd_btns:
+                b.configure(state="normal" if self.cmd_btns_on else "disabled")
         try:
             while True:
                 self.logbox.add(self.logq.get_nowait())
@@ -346,7 +539,8 @@ class App:
         msg = s["message"] or ""
         lines = [
             f"CALL ID  {s['call_id'] or '-'}",
-            f"STATE    {state.upper()}  {msg[:30]}" + (f"   LISTEN {s['listeners']}" if s['listeners'] is not None else ""),
+            f"STATE    {state.upper()}  {msg[:30]}" + (f"   LISTEN {s['listeners']}" + (f"/{s['slots']}" if s['slots'] else "")
+                                             if s['listeners'] is not None else ""),
             f"TIME     {hms(s['time'])}   {s['kbps']:.1f} kbit/s   HOPS {s['hops'] if s['hops'] is not None else '-'}"
             f"   DROPS {s['underruns']}",
             f"TRACK    {s['track'][:46] or '-'}",
@@ -354,6 +548,10 @@ class App:
         for i, t in enumerate(lines):
             c.create_text(12, 44 + i * 18, text=t, anchor="w", fill=col, font=LCD_FONT, tags=("cid",) if i == 0 else ())
         draw_vu(c, w, self.vu, active)
+        if self.stamping:
+            on = (self.tick // 5) % 2 == 0
+            c.create_rectangle(w - 180, 88, w - 108, 106, outline=AMBER, fill=AMBER if on else LCD_BG)
+            c.create_text(w - 144, 97, text="STAMP", fill=LCD_BG if on else AMBER, font=LCD_BOLD)
 
 
 def main():

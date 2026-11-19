@@ -24,19 +24,25 @@ except Exception:
 from LXST.Codecs import Opus
 from LXST.Codecs.libs.pyogg import opus, OpusEncoder
 
-__version__ = "0.3"
+__version__ = "0.4"
 
 APP_NAME = "lxst"
 ASPECT = "telephony"
 STATION_ASPECT = ("radiolxst", "station")
 FIELD_META = "radiolxst"
+FIELD_LISTENER = "radiolxst_listener"  # the name a client sends us inside the call
 META_REFRESH = 30
 ANNOUNCE_MIN_EVERY = 20  # minutes, periodic announces never more often
 ANNOUNCE_MIN_GAP = 600   # seconds between any two announces (manual, on air, stop)
+STATUS_MAX_PER_MIN = 120  # status requests answered per minute, all askers together
+ANNOUNCE_SPACING = 5     # seconds between the announces of one round
+LXMF_MIN_EVERY_H = 1     # LXMF address announce, hours
+NAME_RETRY = 30          # seconds between name lookups of a listener still unnamed
 FIELD_SIGNALLING = 0x00
 FIELD_FRAMES = 0x01
 CODEC_OPUS = b"\x01"
 
+STATUS_BUSY = 0x00
 STATUS_AVAILABLE = 0x03
 STATUS_RINGING = 0x04
 STATUS_CONNECTING = 0x05
@@ -326,6 +332,9 @@ class Listener:
     def __init__(self, link):
         self.link = link
         self.identity = None
+        self.user = ""  # display name from the listener's LXMF announce
+        self.name_tried = 0
+        self.user_sent = False  # the name came from the client itself
         self.caller_profile = None
         self.profile = DEFAULT_PROFILE
         self.state = "connecting"
@@ -337,20 +346,36 @@ class Listener:
     def name(self):
         return self.identity.hash.hex() if self.identity else "?"
 
+    @property
+    def label(self):
+        return self.name + (f" ({self.user})" if self.user else "")
+
+    def lookup_user(self):
+        from station_lxmf import lxmf_hash, lxmf_name
+        self.name_tried = time.time()
+        if self.identity and not self.user and not self.user_sent:
+            self.user = lxmf_name(lxmf_hash(self.identity))[:32]
+
 
 class Radio:
-    def __init__(self, identity, name="radio-lxst"):
+    def __init__(self, identity, name="radio-lxst", storage=None, lxmf_on=True):
         self.identity, self.name = identity, name
+        self.storage = storage or os.path.join(os.path.dirname(os.path.abspath(__file__)), "storage")
+        self.lx = None  # StationLXMF, made when LXMF is first switched on
+        self._lxmf_every_h = 3
+        self.last_lxmf_announce = 0
         self.source = None
         self.monitor = None  # local listening, a Player from radio_client
         self.on_air = False
         self.announce_on_start = True
         self._every = 60
         self.last_announce = 0
+        self.announce_pending = False  # one held back by the 10 min gap: sent when the gap is over
         self.stamps_done = 0
         self.stamps_ready = False
         self.pending_source = None  # On air pressed while stamps are still being made
         self.listeners = {}
+        self.slots = 0  # max listeners, 0 = no limit
         self.lock = threading.Lock()
         self.encoders = {}
         self.total_calls = 0
@@ -365,13 +390,16 @@ class Radio:
 
         self.dest = RNS.Destination(identity, RNS.Destination.IN, RNS.Destination.SINGLE, APP_NAME, ASPECT)
         self.dest.set_link_established_callback(self._link_established)
-        # LXMF address with the station name, so it shows up in Sideband's announce list
-        self.lxmf = RNS.Destination(identity, RNS.Destination.IN, RNS.Destination.SINGLE, "lxmf", "delivery")
         # station directory entry, heard by radio_client
         self.station = RNS.Destination(identity, RNS.Destination.IN, RNS.Destination.SINGLE, *STATION_ASPECT)
         # path responses re-announce with the default app data: keep name and info in them too
         self.station.set_default_app_data(self.station_info)
-        self.lxmf.set_default_app_data(lambda: mp.packb([self.name.encode("utf-8"), None]))
+        # live state (on air, listeners, track) on request: GET "status" over a Link
+        self.status_hits = []
+        self.station.register_request_handler("status", response_generator=self._status_request,
+                                              allow=RNS.Destination.ALLOW_ALL)
+        if lxmf_on:
+            self.lxmf_on = True
         threading.Thread(target=self._prepare_stamps, daemon=True).start()
         threading.Thread(target=self._announce_loop, daemon=True).start()
         threading.Thread(target=self._meta_loop, daemon=True).start()
@@ -394,14 +422,63 @@ class Radio:
     def identity_hash(self):
         return self.identity.hash.hex()
 
+    @property
+    def lxmf_hash(self):
+        return RNS.Destination.hash(self.identity, "lxmf", "delivery").hex()
+
+    @property
+    def lxmf_on(self):
+        return bool(self.lx and self.lx.enabled)
+
+    @lxmf_on.setter
+    def lxmf_on(self, on):
+        if on and self.lx is None:
+            from station_lxmf import StationLXMF
+            self.lx = StationLXMF(self, self.storage)
+            RNS.log(f"LXMF autoresponder on, {len(self.lx.subs)} subscriber(s)", RNS.LOG_NOTICE)
+            if self.stamps_ready:
+                threading.Thread(target=self._stamp_one, args=(self.lx.dest,), daemon=True).start()
+        elif self.lx:
+            self.lx.set_enabled(bool(on))
+
+    def is_subscribed(self, identity):
+        if not identity or not self.lx:
+            return False
+        return RNS.Destination.hash(identity, "lxmf", "delivery").hex() in self.lx.subs
+
+    @property
+    def lxmf_every_h(self):
+        return self._lxmf_every_h
+
+    @lxmf_every_h.setter
+    def lxmf_every_h(self, hours):
+        self._lxmf_every_h = max(LXMF_MIN_EVERY_H, int(hours))
+
     def _stamp_dests(self):
-        return (self.dest, self.lxmf, self.station)
+        return (self.dest, self.station) + ((self.lx.dest,) if self.lxmf_on else ())
+
+    @property
+    def stamps_total(self):
+        return len(self._stamp_dests())
+
+    def _stamp_one(self, d):
+        if not getattr(RNS.Transport, "STAMP_DESTINATIONS", False) or not hasattr(d, "_await_stamp") \
+                or d.stamp is not None:
+            return
+        t = time.time()
+        try:
+            d._await_stamp()
+        except Exception as e:
+            RNS.log(f"Stamp for {RNS.prettyhexrep(d.hash)} failed: {e}", RNS.LOG_ERROR)
+        if time.time() - t > 1:
+            RNS.log(f"Stamp for {RNS.prettyhexrep(d.hash)} ready in {time.time() - t:.0f} s", RNS.LOG_NOTICE)
 
     def _prepare_stamps(self):
         """Make the announce stamps (RNS 1.6.1+) before going on air: done once, then reused from disk."""
         if getattr(RNS.Transport, "STAMP_DESTINATIONS", False):
-            todo = [d for d in self._stamp_dests() if hasattr(d, "_await_stamp") and d.stamp is None]
-            self.stamps_done = len(self._stamp_dests()) - len(todo)
+            dests = self._stamp_dests()
+            todo = [d for d in dests if hasattr(d, "_await_stamp") and d.stamp is None]
+            self.stamps_done = len(dests) - len(todo)
             for d in todo:
                 t = time.time()
                 try:
@@ -410,8 +487,9 @@ class Radio:
                     RNS.log(f"Stamp for {RNS.prettyhexrep(d.hash)} failed: {e}", RNS.LOG_ERROR)
                 self.stamps_done += 1
                 if time.time() - t > 1:
-                    RNS.log(f"Stamp {self.stamps_done}/3 ready in {time.time() - t:.0f} s", RNS.LOG_NOTICE)
-        self.stamps_done = len(self._stamp_dests())
+                    RNS.log(f"Stamp {self.stamps_done}/{len(dests)} ready in {time.time() - t:.0f} s",
+                            RNS.LOG_NOTICE)
+        self.stamps_done = self.stamps_total
         self.stamps_ready = True
         src, self.pending_source = self.pending_source, None
         if src:
@@ -435,6 +513,8 @@ class Radio:
         RNS.log(f"{self.name} on air", RNS.LOG_NOTICE)
         if self.announce_on_start:
             self.announce()
+        if self.lxmf_on:
+            self.lx.notify_on_air()
 
     def switch_source(self, source):
         """Change the audio source while on air, listeners stay connected."""
@@ -451,13 +531,6 @@ class Radio:
         was_on = self.on_air
         self.on_air = False
         self.on_air_since = None
-        if was_on and not self.announce_wait():
-            # tell the directory we are off air
-            try:
-                self.station.announce(app_data=self.station_info())
-                self.last_announce = time.time()
-            except Exception:
-                pass
         with self.lock:
             ls = list(self.listeners.values())
         for l in ls:
@@ -472,31 +545,79 @@ class Radio:
         RNS.log(f"{self.name} off air", RNS.LOG_NOTICE)
 
     def announce(self):
-        """Announce all three destinations; returns False if the last one was under 10 min ago."""
+        """One round, 5 s apart: telephony, station, LXMF when due. False if the last round was under 10 min ago."""
         wait = self.announce_wait()
         if wait:
-            RNS.log(f"Announce skipped, next one allowed in {wait / 60:.0f} min", RNS.LOG_NOTICE)
+            self.announce_pending = True
+            RNS.log(f"Announce held, sent in {wait / 60:.0f} min (one every {ANNOUNCE_MIN_GAP // 60} min)",
+                    RNS.LOG_NOTICE)
             return False
-        self.dest.announce()
-        self.lxmf.announce(app_data=mp.packb([self.name.encode("utf-8"), None]))
-        self.station.announce(app_data=self.station_info())
+        self.announce_pending = False
         self.last_announce = time.time()
-        if self.stamps_ready:
-            RNS.log(f"Announced {self.name}", RNS.LOG_NOTICE)
-        else:
-            RNS.log(f"Announce of {self.name} queued until the stamps are ready", RNS.LOG_NOTICE)
+        lxmf = self.lxmf_on and time.time() - self.last_lxmf_announce >= self.lxmf_every_h * 3600
+        if lxmf:
+            self.last_lxmf_announce = time.time()
+        threading.Thread(target=self._announce_round, args=(lxmf,), daemon=True).start()
         return True
+
+    def _announce_round(self, lxmf):
+        parts = [("telephony", self.dest.announce),
+                 ("station", lambda: self.station.announce(app_data=self.station_info()))]
+        if lxmf:
+            parts.append(("LXMF", self.lx.announce))
+        for i, (_, send) in enumerate(parts):
+            if i:
+                time.sleep(ANNOUNCE_SPACING)
+            try:
+                send()
+            except Exception as e:
+                RNS.log(f"Announce failed: {e}", RNS.LOG_ERROR)
+        what = ", ".join(p[0] for p in parts)
+        if self.stamps_ready:
+            RNS.log(f"Announced {self.name} ({what})", RNS.LOG_NOTICE)
+        else:
+            RNS.log(f"Announce of {self.name} ({what}) queued until the stamps are ready", RNS.LOG_NOTICE)
+
+    def source_kind(self):
+        src = self.source
+        if src is None:
+            return ""
+        return "folder playlist" if src.folder else ("stream" if src.url else "live input")
+
+    def now_playing_text(self):
+        src = self.source
+        return (src.now_playing or "-" if src.folder else "Live Stream") if src else "-"
 
     def meta(self):
         with self.lock:
             n = sum(1 for l in self.listeners.values() if l.state == "listening")
         src = self.source
         np_ = (src.now_playing if src.folder else "Live streaming") if src else ""
-        return {"v": __version__, "n": self.name[:48], "l": n, "np": np_[:64],
+        return {"v": __version__, "n": self.name[:48], "l": n, "s": self.slots, "np": np_[:64],
                 "kb": 28 if FRAME_MS >= 120 else 56, "air": self.on_air}
 
+    def is_full(self, but=None):
+        """All listener slots taken (ringing callers count too, so two at once cannot both get in)."""
+        if not self.slots:
+            return False
+        with self.lock:
+            n = sum(1 for l in self.listeners.values() if l is not but and l.state in ("listening", "ringing"))
+        return n >= self.slots
+
     def station_info(self):
-        return mp.packb(self.meta())
+        # the announce says who we are, never what changes: the state is asked with a status request
+        return mp.packb({"v": __version__, "n": self.name[:48], "kb": 28 if FRAME_MS >= 120 else 56})
+
+    def _status_request(self, path, data, request_id, link_id, remote_identity, requested_at):
+        now = time.time()
+        with self.lock:
+            hits = [t for t in self.status_hits if now - t < 60]
+            if len(hits) >= STATUS_MAX_PER_MIN:
+                self.status_hits = hits
+                return None  # too many: no answer, the asker sees "no reply"
+            hits.append(now)
+            self.status_hits = hits
+        return self.meta()
 
     # in-call info: LXST only reads keys 0x00/0x01, other phones ignore this one
     def _send_meta(self, links, meta):
@@ -515,6 +636,11 @@ class Radio:
             if not self.on_air:
                 last = None
                 continue
+            with self.lock:
+                unnamed = [l for l in self.listeners.values()
+                           if l.identity and not l.user and time.time() - l.name_tried >= NAME_RETRY]
+            for l in unnamed:
+                l.lookup_user()
             m = self.meta()
             if m != last or time.time() - last_t >= META_REFRESH:
                 with self.lock:
@@ -527,7 +653,12 @@ class Radio:
         while True:
             time.sleep(5)
             every = self.announce_every_min
-            if self.on_air and every and time.time() - self.last_announce >= every * 60:
+            if self.announce_pending and not self.announce_wait():
+                # held by the 10 min gap: presence only, so only if still on air
+                self.announce_pending = False
+                if self.on_air:
+                    self.announce()
+            elif self.on_air and every and time.time() - self.last_announce >= every * 60:
                 self.announce()
 
     # call setup, server side of LXST Telephony
@@ -554,6 +685,15 @@ class Radio:
         if not lst:
             return
         lst.identity = identity
+        lst.lookup_user()
+        if self.is_full(but=lst):
+            # BUSY: Sideband/rnphone show "busy", our clients "station full"
+            lst.state = "full"
+            self._send_meta([link], self.meta())
+            self._signal(link, [STATUS_BUSY])
+            RNS.log(f"Listener {lst.label} refused: all {self.slots} slots taken", RNS.LOG_NOTICE)
+            threading.Timer(2.0, link.teardown).start()
+            return
         lst.state = "ringing"
         self._signal(link, [STATUS_RINGING])
         threading.Timer(ANSWER_DELAY, self._answer, args=(lst,)).start()
@@ -571,15 +711,23 @@ class Radio:
             n = sum(1 for l in self.listeners.values() if l.state == "listening")
         self.peak_listeners = max(self.peak_listeners, n)
         self._send_meta([lst.link], self.meta())
-        RNS.log(f"Listener {lst.name} tuned in ({self.profile_label(lst)})", RNS.LOG_NOTICE)
+        RNS.log(f"Listener {lst.label} tuned in ({self.profile_label(lst)})", RNS.LOG_NOTICE)
 
     def _packet(self, lst, data):
-        # caller audio is ignored, only signalling matters
+        # caller audio is ignored, only signalling and the listener's name matter
         try:
             msg = mp.unpackb(data)
         except Exception:
             return
-        if not isinstance(msg, dict) or FIELD_SIGNALLING not in msg:
+        if not isinstance(msg, dict):
+            return
+        info = msg.get(FIELD_LISTENER)
+        if isinstance(info, dict) and info.get("n"):
+            name = "".join(c for c in str(info["n"]) if c.isprintable()).strip()[:32]
+            if name and name != lst.user:
+                old, lst.user, lst.user_sent = lst.user, name, True
+                RNS.log(f"Listener {lst.name} is {name}" + (f" (was {old})" if old else ""), RNS.LOG_NOTICE)
+        if FIELD_SIGNALLING not in msg:
             return
         sigs = msg[FIELD_SIGNALLING]
         for s in (sigs if isinstance(sigs, list) else [sigs]):
@@ -587,13 +735,13 @@ class Radio:
                 lst.caller_profile = s - PREFERRED_PROFILE
                 if lst.state == "listening":
                     lst.profile = PROFILE_MAP.get(lst.caller_profile, DEFAULT_PROFILE)
-                    RNS.log(f"Listener {lst.name} switched to {self.profile_label(lst)}", RNS.LOG_NOTICE)
+                    RNS.log(f"Listener {lst.label} switched to {self.profile_label(lst)}", RNS.LOG_NOTICE)
 
     def _link_closed(self, link):
         with self.lock:
             lst = self.listeners.pop(link.link_id, None)
         if lst and lst.state == "listening":
-            RNS.log(f"Listener {lst.name} left after {RNS.prettytime(time.time() - lst.since)}", RNS.LOG_NOTICE)
+            RNS.log(f"Listener {lst.label} left after {RNS.prettytime(time.time() - lst.since)}", RNS.LOG_NOTICE)
 
     @staticmethod
     def profile_label(lst):
@@ -671,7 +819,7 @@ class Radio:
         for l in ls:
             on = l.state == "listening"
             rows.append({
-                "id": l.name, "state": l.state, "profile": self.profile_label(l) if on else "",
+                "id": l.name, "user": l.user, "state": l.state, "sub": self.is_subscribed(l.identity), "profile": self.profile_label(l) if on else "",
                 "time": now - l.since if on else 0,
                 "kbps": l.sent_bytes * 8 / max(1, now - l.since) / 1000 if on else 0,
                 "lost": l.failed,
@@ -691,6 +839,7 @@ class Radio:
             if self.on_air and self.announce_every_min else None,
             "announce_wait": self.announce_wait(),
             "stamps_ready": self.stamps_ready, "stamps_done": self.stamps_done,
+            "stamps_total": self.stamps_total,
             "waiting": self.pending_source is not None,
         }
 
@@ -700,11 +849,11 @@ class Radio:
                  f"(total calls {s['calls']}, buffer {s['buffer_ms']} ms, {FRAME_MS} ms frames, "
                  f"send late max {s['late_ms']:.0f} ms)"]
         if s["waiting"]:
-            lines[0] += f"  preparing stamps {s['stamps_done']}/3, on air when ready"
+            lines[0] += f"  preparing stamps {s['stamps_done']}/{s['stamps_total']}, on air when ready"
         self.max_late = 0.0
         for r in s["rows"]:
             dur = RNS.prettytime(r["time"]) if r["state"] == "listening" else r["state"]
-            lines.append(f"   {r['id']}  {r['profile']}  {dur}  {r['kbps']:.1f} kbit/s"
+            lines.append(f"   {r['id']}" + (f" ({r['user']})" if r["user"] else "") + f"  {r['profile']}  {dur}  {r['kbps']:.1f} kbit/s"
                          + (f"  lost {r['lost']}" if r["lost"] else ""))
         return "\n".join(lines)
 
@@ -733,6 +882,11 @@ def main():
     ap.add_argument("--frame-ms", type=int, choices=[60, 120], default=120,
                     help="120 = steadier on slow paths (max ~28 kbit/s), 60 = up to 56 kbit/s")
     ap.add_argument("--announce-every", type=int, default=60, help=f"minutes between announces (min {ANNOUNCE_MIN_EVERY}), 0 = only at start")
+    ap.add_argument("--no-lxmf", action="store_true",
+                    help="no LXMF address: no autoresponder, no subscriber messages, one announce less")
+    ap.add_argument("--lxmf-every", type=int, default=3, metavar="HOURS",
+                    help=f"hours between LXMF address announces (min {LXMF_MIN_EVERY_H})")
+    ap.add_argument("--slots", type=int, default=0, help="max listeners at once (limits the upload), 0 = no limit")
     ap.add_argument("--gain", type=float, default=0.0, help="output volume in dB (-24..+12)")
     ap.add_argument("--no-limiter", action="store_true", help="disable the peak limiter")
     ap.add_argument("--ceiling", type=float, default=-2.0, help="limiter ceiling in dBFS")
@@ -745,8 +899,11 @@ def main():
     set_frame_ms(a.frame_ms)
 
     RNS.Reticulum(configdir=a.rnsconfig, loglevel=RNS.LOG_NOTICE + a.verbose)
-    radio = Radio(load_identity(a.identity), a.name)
+    radio = Radio(load_identity(a.identity), a.name, storage=os.path.dirname(os.path.abspath(a.identity)),
+                  lxmf_on=not a.no_lxmf)
+    radio.slots = max(0, a.slots)
     radio.announce_every_min = a.announce_every
+    radio.lxmf_every_h = a.lxmf_every
     radio.gain_db = max(-24.0, min(12.0, a.gain))
     radio.limiter_on = not a.no_limiter
     radio.limiter.ceiling_db = min(0.0, a.ceiling)
@@ -754,7 +911,8 @@ def main():
 
     print(f"\n  {a.name}  " + ("on air" if radio.on_air else "preparing stamps, on air when ready"))
     print(f"  Call this identity from Sideband / rnphone:  {radio.identity_hash}")
-    print(f"  LXST destination: {radio.dest.hash.hex()}   LXMF: {radio.lxmf.hash.hex()}")
+    print(f"  LXST destination: {radio.dest.hash.hex()}   LXMF: "
+          + (radio.lxmf_hash if radio.lxmf_on else "off"))
     print(f"  Source: {a.url or a.folder or a.input}\n")
     try:
         while True:

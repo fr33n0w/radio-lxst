@@ -21,12 +21,13 @@ except Exception:
 
 from LXST.Codecs import Opus
 
-__version__ = "0.3"
+__version__ = "0.4"
 
 STATION_ASPECT = "radiolxst.station"
 FIELD_SIGNALLING = 0x00
 FIELD_FRAMES = 0x01
 FIELD_META = "radiolxst"  # station info inside the call, ignored by plain LXST phones
+FIELD_LISTENER = "radiolxst_listener"  # our name, sent to the station inside the call
 STATUS_BUSY, STATUS_REJECTED, STATUS_AVAILABLE, STATUS_RINGING = 0x00, 0x01, 0x03, 0x04
 STATUS_CONNECTING, STATUS_ESTABLISHED = 0x05, 0x06
 PREFERRED_MODE, PREFERRED_PROFILE = 0xF0, 0xFF
@@ -42,6 +43,12 @@ DIAL_TRIES = 2                  # second try drops the path first: the first one
 RETRY_WAITS = (15, 30, 60, 120)  # pauses before redialing after a drop while playing
 NO_AUDIO_S = 20                 # playing but no audio this long = lost (RNS notices a dead link much later)
 STEADY_S = 60                   # this much good listening resets the retry count
+STATUS_EVERY = 180              # seconds between status requests to one station
+STATUS_MIN_GAP = 15             # Refresh button: not more often than this per station
+STATUS_WINDOW = 24 * 3600       # only stations heard (announce or answer) in the last day are asked
+STATUS_PARALLEL = 3             # status requests at once
+STATUS_TIMEOUT = 25             # path + link + answer
+NO_ANSWER = "no answer"
 
 
 def drop_path(dh):
@@ -224,11 +231,30 @@ class Player:
                 player.play(f.astype(np.float32))
 
 
+def announce_emitted(destination_hash):
+    """Emission time of the announce just received (signed by the station, repeaters cannot change it), 0 if unknown."""
+    try:
+        blobs = RNS.Transport.path_table[destination_hash][4]  # IDX_PT_RANDBLOBS
+        return int.from_bytes(blobs[-1][5:10], "big") if blobs else 0
+    except Exception:
+        return 0
+
+
 class Station:
     def __init__(self, call_id, name="", listeners=None, now_playing="", kbps=None, on_air=True):
         self.call_id, self.name, self.listeners = call_id, name, listeners
         self.now_playing, self.kbps, self.on_air = now_playing, kbps, on_air
+        self.slots = 0  # 0 = no limit or unknown
+        self.emitted = 0  # when the station sent its last announce (its own clock)
+        self.legacy = False  # before 0.4 the state came in the announce, newer stations answer a status request
+        self.checked = 0  # last status request (answered or not)
         self.heard = time.time()
+
+    @property
+    def listeners_text(self):
+        if self.listeners is None:
+            return ""
+        return f"{self.listeners}/{self.slots}" if self.slots else str(self.listeners)
 
     @property
     def hops(self):
@@ -237,7 +263,8 @@ class Station:
 
     def to_dict(self):
         return {"call_id": self.call_id, "name": self.name, "listeners": self.listeners,
-                "now_playing": self.now_playing, "kbps": self.kbps, "on_air": self.on_air, "heard": self.heard}
+                "now_playing": self.now_playing, "kbps": self.kbps, "on_air": self.on_air, "heard": self.heard,
+                "slots": self.slots, "emitted": self.emitted, "legacy": self.legacy, "checked": self.checked}
 
 
 class Directory:
@@ -249,12 +276,18 @@ class Directory:
         self.path = path
         self.stations = {}
         self.on_change = None
+        self._busy = set()
+        self._busy_lock = threading.Lock()
         try:
             with open(path, encoding="utf-8") as f:
                 for d in json.load(f):
                     s = Station(d["call_id"], d.get("name", ""), d.get("listeners"), d.get("now_playing", ""),
                                 d.get("kbps"), d.get("on_air", True))
                     s.heard = d.get("heard", 0)
+                    s.slots = d.get("slots", 0) or 0
+                    s.emitted = d.get("emitted", 0) or 0
+                    s.legacy = bool(d.get("legacy", False))
+                    s.checked = d.get("checked", 0) or 0
                     self.stations[s.call_id] = s
         except Exception:
             pass
@@ -263,18 +296,36 @@ class Directory:
     def received_announce(self, destination_hash, announced_identity, app_data):
         try:
             cid = announced_identity.hash.hex()
+            emitted = announce_emitted(destination_hash)
+            old = self.stations.get(cid)
+            if emitted and old and emitted <= old.emitted:
+                # a repeater replaying an announce we already had: the station did not speak again
+                RNS.log(f"Ignored replayed announce of {old.name or cid} "
+                        f"(sent {time.strftime('%d/%m %H:%M', time.localtime(emitted))})", RNS.LOG_INFO)
+                return
             if not app_data:
                 # path response without data: only refresh, never wipe what we know
-                if cid in self.stations:
-                    self.stations[cid].heard = time.time()
+                if old:
+                    old.heard, old.emitted = time.time(), max(old.emitted, emitted)
                 return
             info = mp.unpackb(app_data)
             if not isinstance(info, dict):
                 return
-            s = Station(cid, str(info.get("n", ""))[:48], info.get("l"), str(info.get("np", ""))[:64],
-                        info.get("kb"), bool(info.get("air", True)))
+            if "air" in info:
+                # station before 0.4: its state is in the announce
+                s = Station(cid, str(info.get("n", ""))[:48], info.get("l"), str(info.get("np", ""))[:64],
+                            info.get("kb"), bool(info.get("air", True)))
+                s.slots = info.get("s") or 0
+                s.legacy = True
+                RNS.log(f"Heard station {s.name or cid} ({'on air' if s.on_air else 'off air'})", RNS.LOG_NOTICE)
+            else:
+                # the announce only says the station exists: its state is asked (status request)
+                s = old or Station(cid, on_air=False)
+                s.name, s.kbps, s.legacy, s.heard = str(info.get("n", ""))[:48], info.get("kb"), False, time.time()
+                s.checked = 0  # ask now
+                RNS.log(f"Heard station {s.name or cid}", RNS.LOG_NOTICE)
+            s.emitted = emitted
             self.stations[cid] = s
-            RNS.log(f"Heard station {s.name or cid} ({'on air' if s.on_air else 'off air'})", RNS.LOG_NOTICE)
             self.save()
             if callable(self.on_change):
                 self.on_change()
@@ -289,14 +340,106 @@ class Directory:
         except OSError:
             pass
 
+    # live state: asked to the station (GET "status" over a Link), never put in announces
+    def poll(self, skip=()):
+        """Ask the stations heard lately for their state, a few at a time, each every STATUS_EVERY s."""
+        now = time.time()
+        with self._busy_lock:
+            for s in sorted(list(self.stations.values()), key=lambda s: s.checked):
+                if len(self._busy) >= STATUS_PARALLEL:
+                    break
+                if s.legacy or s.call_id in skip or s.call_id in self._busy or now - s.heard > STATUS_WINDOW \
+                        or now - s.checked < STATUS_EVERY:
+                    continue
+                self._busy.add(s.call_id)
+                s.checked = now
+                threading.Thread(target=self._check, args=(s,), daemon=True).start()
+
+    def refresh(self, skip=()):
+        """Refresh button: ask again now (not more than once every STATUS_MIN_GAP s per station)."""
+        for s in list(self.stations.values()):
+            if not s.legacy and time.time() - s.checked >= STATUS_MIN_GAP:
+                s.checked = 0
+        self.poll(skip)
+
+    def _check(self, s):
+        try:
+            st = ask_status(s.call_id)
+            if st == NO_ANSWER:
+                # link up, request not answered: a station before 0.4 (or busy), keep what we know
+                RNS.log(f"Station {s.name or s.call_id}: link ok, no status answer", RNS.LOG_INFO)
+            elif st is None:
+                if s.on_air or s.listeners or s.now_playing != "no reply":
+                    RNS.log(f"Station {s.name or s.call_id}: no reply to status", RNS.LOG_INFO)
+                s.on_air, s.listeners, s.now_playing = False, None, "no reply"
+            else:
+                s.on_air, s.listeners = bool(st.get("air")), st.get("l")
+                s.now_playing = str(st.get("np") or "")[:64] if s.on_air else "off air"
+                s.slots = st.get("s") or 0
+                s.name = str(st.get("n") or s.name)[:48]
+                s.heard = time.time()
+            self.save()
+            if callable(self.on_change):
+                self.on_change()
+        finally:
+            with self._busy_lock:
+                self._busy.discard(s.call_id)
+
+    def mark_off(self, call_id):
+        """The station hung up or refused us: show it off air until it announces again."""
+        s = self.stations.get(call_id)
+        if s and (s.on_air or s.listeners or s.now_playing != "offline"):
+            s.on_air, s.listeners, s.now_playing = False, 0, "offline"
+            self.save()
+
     def name_of(self, call_id):
         s = self.stations.get(call_id)
         return s.name if s else ""
 
 
+def ask_status(call_id, timeout=STATUS_TIMEOUT):
+    """The station's live state (dict of the in-call info), NO_ANSWER if the link came up but the request
+    was not answered, None if the station cannot be reached."""
+    try:
+        ident_hash = bytes.fromhex(call_id)
+        dh = RNS.Destination.hash_from_name_and_identity(STATION_ASPECT, ident_hash)
+    except ValueError:
+        return None
+    end = time.time() + timeout
+    if not RNS.Transport.has_path(dh):
+        RNS.Transport.request_path(dh)
+        while not RNS.Transport.has_path(dh) and time.time() < end:
+            time.sleep(0.25)
+    ident = RNS.Identity.recall(dh)
+    if ident is None or ident.hash != ident_hash:
+        return None
+    dest = RNS.Destination(ident, RNS.Destination.OUT, RNS.Destination.SINGLE, *STATION_ASPECT.split("."))
+    box, done = [], threading.Event()
+    link = RNS.Link(dest)
+    try:
+        while link.status != RNS.Link.ACTIVE and link.status != RNS.Link.CLOSED and time.time() < end:
+            time.sleep(0.1)
+        if link.status != RNS.Link.ACTIVE:
+            return None
+        link.request("status", None, response_callback=lambda r: (box.append(r.response), done.set()),
+                     failed_callback=lambda r: done.set(), timeout=max(1.0, end - time.time()))
+        done.wait(max(0.5, end - time.time()) + 1)
+        return box[0] if box and isinstance(box[0], dict) else NO_ANSWER
+    finally:
+        try:
+            link.teardown()
+        except Exception:
+            pass
+
+
+def default_listener_name(identity):
+    return f"Radio-LXST Client #{identity.hash.hex()[:4]}" if identity else "Radio-LXST Client"
+
+
 class Client:
-    def __init__(self, identity, prefill=3.0, device=None):
+    def __init__(self, identity, prefill=3.0, device=None, nick=""):
         self.identity = identity
+        self.nick = nick
         self.player = Player(prefill, device)
         self.link = None
         self.state = "idle"
@@ -314,6 +457,25 @@ class Client:
         self.last_audio = 0.0
         self._retry_lock = threading.Lock()
         self._lock = threading.RLock()  # tune/hangup vs packets of the old link
+
+    @property
+    def listener_name(self):
+        return (self.nick or "").strip()[:32] or default_listener_name(self.identity)
+
+    def set_nick(self, nick):
+        """The name the station shows for us; sent now if a call is on."""
+        if (nick or "").strip() == (self.nick or "").strip():
+            return
+        self.nick = nick
+        link = self.link
+        if link is not None and self.state == "playing":
+            self._send_name(link)
+
+    def _send_name(self, link):
+        try:
+            RNS.Packet(link, mp.packb({FIELD_LISTENER: {"n": self.listener_name}}), create_receipt=False).send()
+        except Exception:
+            pass
 
     def tune(self, call_id, profile=None, name="", why=""):
         self.hangup()
@@ -422,15 +584,21 @@ class Client:
                 self.state, self.message = "playing", ""
                 self.started = self.last_audio = time.time()
                 self.player.start()
+                self._send_name(link)
                 threading.Thread(target=self._watch, args=(gen, link), daemon=True).start()
                 RNS.log(f"Tuned in to {self.station_name or self.call_id}", RNS.LOG_NOTICE)
-            elif s in (STATUS_BUSY, STATUS_REJECTED):
-                self._fail("station busy or off air")
         meta = msg.get(FIELD_META)
         if isinstance(meta, dict):
             self.meta = meta
             if meta.get("n"):
                 self.station_name = str(meta["n"])[:48]
+        for s in msg.get(FIELD_SIGNALLING, []) if isinstance(msg.get(FIELD_SIGNALLING), list) else []:
+            if s == STATUS_BUSY:
+                m = self.meta
+                full = f" ({m['l']}/{m['s']})" if m.get("s") and m.get("l") is not None else ""
+                self._fail(f"station full{full}, try later")
+            elif s == STATUS_REJECTED:
+                self._fail("station off air")
         frames = msg.get(FIELD_FRAMES)
         if frames is not None:
             for f in frames if isinstance(frames, list) else [frames]:
@@ -533,7 +701,7 @@ class Client:
             cid, name, meta = self.call_id or "", self.station_name, self.meta
         return {
             "state": self.state, "message": self.message, "call_id": cid,
-            "name": name, "listeners": meta.get("l"), "track": str(meta.get("np") or ""),
+            "name": name, "listeners": meta.get("l"), "slots": meta.get("s") or 0, "track": str(meta.get("np") or ""),
             "time": el, "kbps": self.bytes * 8 / el / 1000 if el > 1 else 0,
             "buffer_s": p.buffer_s, "player": p.state, "underruns": p.underruns, "levels": p.levels,
             "hops": (RNS.Transport.hops_to(self.link.destination.hash)
@@ -560,23 +728,57 @@ def main():
     ap.add_argument("--volume", type=float, default=0.0, help="dB")
     ap.add_argument("--device", default=None, help="output device (part of its name)")
     ap.add_argument("--identity", default=os.path.join(here, "storage", "client_identity"))
+    ap.add_argument("--nick", default="", help="your name shown by the station (default Radio-LXST Client #xxxx)")
+    ap.add_argument("--cmd", default=None, help="send a command to the station (help, info, status, link, "
+                                                 "subscribe, unsubscribe) and print the reply")
     ap.add_argument("--rnsconfig", default=None)
     a = ap.parse_args()
 
     RNS.Reticulum(configdir=a.rnsconfig, loglevel=RNS.LOG_NOTICE)
     directory = Directory(os.path.join(here, "storage", "stations.json"))
+    if a.cmd and a.call_id:
+        import client_lxmf
+        ident = load_identity(a.identity)
+        client_lxmf.ensure_stamp(ident)
+        cm = client_lxmf.Commands(ident, os.path.join(here, "storage"), a.nick or default_listener_name(ident),
+                                  directory)
+        cid = a.call_id.strip().lower()
+        n = len(cm.transcript(cid))
+        cm.send(cid, a.cmd)
+        t = time.time()
+        while time.time() - t < client_lxmf.REPLY_WAIT:
+            time.sleep(0.5)
+            rows = cm.transcript(cid)[n:]
+            if any(r["dir"] == "in" for r in rows):
+                for r in rows:
+                    if r["dir"] == "in":
+                        print(r["text"])
+                return
+            if rows and rows[0]["state"].startswith("failed"):
+                sys.exit(f"Command {rows[0]['state']}")
+        sys.exit("No reply from the station")
     if a.list or not a.call_id:
         if a.list:
             print(f"Listening for stations for {a.list} s...")
             time.sleep(a.list)
+        # their state, asked to each station
+        t = time.time()
+        for s in directory.stations.values():
+            s.checked = 0
+        while time.time() - t < 90:
+            directory.poll()
+            time.sleep(1)
+            if not directory._busy and all(s.legacy or s.checked for s in directory.stations.values()
+                                           if time.time() - s.heard <= STATUS_WINDOW):
+                break
         for s in sorted(directory.stations.values(), key=lambda s: -s.heard):
-            print(f"  {s.call_id}  {'ON ' if s.on_air else 'off'}  {s.name}  listeners {s.listeners}  "
+            print(f"  {s.call_id}  {'ON ' if s.on_air else 'off'}  {s.name}  listeners {s.listeners_text}  "
                   f"{s.now_playing}")
         if not directory.stations:
             print("  no stations heard yet")
         return
 
-    cl = Client(load_identity(a.identity), prefill=a.buffer, device=a.device)
+    cl = Client(load_identity(a.identity), prefill=a.buffer, device=a.device, nick=a.nick)
     cl.player.volume_db = a.volume
     cl.tune(a.call_id, PROFILES[a.quality], directory.name_of(a.call_id.lower()))
     try:

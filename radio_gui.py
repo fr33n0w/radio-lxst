@@ -12,6 +12,7 @@ from tkinter import ttk, filedialog
 import RNS
 import radio_lxst as rl
 import radio_client as rc
+import station_lxmf as sl
 from ui_common import (LCD_BOLD, BG, EDGE, LCD_BG, DIM, LCD, LCD_DIM, AMBER, UI_FONT, TITLE_FONT, LCD_FONT, LCD_BIG, hms,
                        apply_style, volume_scale, draw_vu, draw_badge, LogBox, copy_text, context_menu, hash_of)
 
@@ -22,6 +23,7 @@ DEFAULTS = {
     "frame_ms": 120, "announce_on_start": True, "announce_every_min": 60,
     "identity": os.path.join(HERE, "storage", "identity"), "rnsconfig": "", "auto_start": False,
     "gain_db": 0.0, "limiter_on": True, "limiter_ceiling_db": -2.0, "monitor_device": "",
+    "lxmf_on": True, "lxmf_every_h": 3, "slots": 0,
 }
 
 def load_settings():
@@ -45,7 +47,7 @@ class App:
 
         root.title("radio-lxst")
         root.configure(bg=BG)
-        root.minsize(660, 590)
+        root.minsize(720, 590)
         apply_style(root)
 
         cfg = self.s["rnsconfig"] or None
@@ -54,7 +56,9 @@ class App:
         RNS.logdest = RNS.LOG_CALLBACK
         RNS.logcall = lambda line: self.logq.put(line)
         rl.set_frame_ms(int(self.s["frame_ms"]))
-        self.radio = rl.Radio(rl.load_identity(self.s["identity"]), self.s["name"])
+        self.radio = rl.Radio(rl.load_identity(self.s["identity"]), self.s["name"],
+                              storage=os.path.dirname(os.path.abspath(self.s["identity"])),
+                              lxmf_on=bool(self.s["lxmf_on"]))
         self._apply_announce()
 
         self._build()
@@ -114,6 +118,7 @@ class App:
         nb.add(self._tab_listeners(nb), text="Listeners")
         nb.add(self._tab_input(nb), text="Input")
         nb.add(self._tab_output(nb), text="Output")
+        nb.add(self._tab_replies(nb), text="Replies")
         nb.add(self._tab_log(nb), text="Log")
         nb.enable_traversal()
 
@@ -125,12 +130,14 @@ class App:
 
     def _tab_listeners(self, nb):
         f = ttk.Frame(nb, padding=6)
-        cols = ("id", "profile", "time", "kbps", "lost")
+        cols = ("id", "user", "sub", "profile", "time", "kbps", "lost")
         self.tree = ttk.Treeview(f, columns=cols, show="headings", height=8)
-        for c, t, w in (("id", "Listener", 255), ("profile", "Quality", 190), ("time", "Time", 70),
-                        ("kbps", "kbit/s", 55), ("lost", "Lost", 40)):
+        for c, t, w in (("id", "Listener", 255), ("user", "Name", 110), ("sub", "Sub", 36),
+                        ("profile", "Quality", 140), ("time", "Time", 70), ("kbps", "kbit/s", 55),
+                        ("lost", "Lost", 40)):
             self.tree.heading(c, text=t)
-            self.tree.column(c, width=w, anchor="w" if c in ("id", "profile") else "e")
+            self.tree.column(c, width=w, anchor="center" if c == "sub" else
+                             ("w" if c in ("id", "user", "profile") else "e"))
         self.tree.pack(fill="both", expand=True)
         self.tree.bind("<Button-3>", self._listener_menu)
         self.tree.bind("<Control-c>", lambda ev: self._copy_listener())
@@ -188,7 +195,16 @@ class App:
         self.v_ann_every = tk.StringVar(value=str(self.s["announce_every_min"]))
 
         ttk.Label(f, text="Station name").grid(row=0, column=0, sticky="w")
-        ttk.Entry(f, textvariable=self.v_name, width=36).grid(row=0, column=1, columnspan=2, sticky="w", pady=2)
+        row = ttk.Frame(f)
+        row.grid(row=0, column=1, columnspan=2, sticky="w", pady=2)
+        ttk.Entry(row, textvariable=self.v_name, width=36).pack(side="left")
+        self.v_slots = tk.StringVar(value=str(self.s["slots"]))
+        ttk.Label(row, text="Listener slots").pack(side="left", padx=(16, 4))
+        sb = ttk.Spinbox(row, from_=0, to=99, increment=1, width=4, textvariable=self.v_slots)
+        sb.pack(side="left")
+        sb.bind("<FocusOut>", lambda e: self.v_slots.set(str(self.radio.slots)))
+        ttk.Label(row, text="0 = no limit; when full new callers get BUSY", style="Dim.TLabel").pack(
+            side="left", padx=4)
 
         ttk.Label(f, text="Quality").grid(row=1, column=0, sticky="nw", pady=(10, 0))
         ttk.Radiobutton(f, text="Steady: 120 ms packets, up to 28 kbit/s (best on slow paths)",
@@ -218,7 +234,7 @@ class App:
         ttk.Label(f, text="Addresses").grid(row=6, column=0, sticky="nw", pady=(14, 0))
         for i, (lbl, val) in enumerate((("Call ID (dial this)", self.radio.identity_hash),
                                          ("LXST destination", self.radio.dest.hash.hex()),
-                                         ("LXMF address", self.radio.lxmf.hash.hex()))):
+                                         ("LXMF address", self.radio.lxmf_hash))):
             ttk.Label(f, text=lbl, style="Dim.TLabel").grid(row=6 + i, column=1, sticky="w",
                                                             pady=(14 if i == 0 else 2, 0))
             e = ttk.Entry(f, width=36)
@@ -238,9 +254,111 @@ class App:
         self.cb_mon.bind("<<ComboboxSelected>>", lambda e: self._monitor_device_changed())
         ttk.Label(f, text="Headphones to hear what goes on air: MON on the display.", style="Dim.TLabel").grid(
             row=11, column=1, columnspan=2, sticky="w")
-        for v in (self.v_name, self.v_frame, self.v_ann_start, self.v_ann_every):
+
+        ttk.Label(f, text="LXMF").grid(row=12, column=0, sticky="w", pady=(14, 0))
+        self.v_lxmf = tk.BooleanVar(value=bool(self.s["lxmf_on"]))
+        self.v_lxmf_every = tk.StringVar(value=str(self.s["lxmf_every_h"]))
+        ttk.Checkbutton(f, text="Autoresponder + on-air message to subscribers", variable=self.v_lxmf).grid(
+            row=12, column=1, columnspan=2, sticky="w", pady=(14, 0))
+        row = ttk.Frame(f)
+        row.grid(row=13, column=1, columnspan=2, sticky="w")
+        ttk.Label(row, text="announce the LXMF address every").pack(side="left")
+        sb = ttk.Spinbox(row, values=(1, 2, 3, 4, 6, 8, 12, 24), width=4, textvariable=self.v_lxmf_every)
+        sb.pack(side="left", padx=4)
+        sb.bind("<FocusOut>", lambda e: self.v_lxmf_every.set(str(self.radio.lxmf_every_h)))
+        ttk.Label(row, text=f"hours (min {rl.LXMF_MIN_EVERY_H}); off = no LXMF address, one announce less").pack(
+            side="left")
+        for v in (self.v_name, self.v_frame, self.v_ann_start, self.v_ann_every, self.v_lxmf, self.v_lxmf_every,
+                  self.v_slots):
             v.trace_add("write", lambda *a: self._output_changed())
         return f
+
+    def _tab_replies(self, nb):
+        # LXMF autoresponder texts: the commands are fixed, what they answer is ours (link stays fixed)
+        f = ttk.Frame(nb, padding=6)
+        self.rep_text = dict(sl.DEFAULT_REPLIES, **sl.load_replies(self.radio.storage))
+        self.rep_saved = dict(self.rep_text)
+        self.rep_cur = None
+        left = ttk.Frame(f)
+        left.pack(side="left", fill="y")
+        self.rep_list = tk.Listbox(left, width=33, height=11, bg=LCD_BG, fg=LCD, selectbackground=EDGE,
+                                   font=LCD_FONT, relief="flat", activestyle="none", exportselection=False)
+        self.rep_list.pack(fill="y", expand=True)
+        self.rep_list.bind("<<ListboxSelect>>", lambda ev: self._rep_pick())
+        right = ttk.Frame(f)
+        right.pack(side="left", fill="both", expand=True, padx=(8, 0))
+        self.rep_edit = tk.Text(right, bg=LCD_BG, fg=LCD, insertbackground=LCD, font=LCD_FONT, relief="flat",
+                                wrap="word", height=7, undo=True)
+        self.rep_edit.pack(fill="both", expand=True)
+        self.rep_edit.bind("<<Modified>>", self._rep_typed)
+        tk.Label(right, text="Placeholders: " + " ".join("{" + p + "}" for p in sl.PLACEHOLDERS),
+                 bg=BG, fg=DIM, font=UI_FONT, anchor="w", justify="left", wraplength=520).pack(fill="x", pady=(4, 0))
+        row = ttk.Frame(right)
+        row.pack(fill="x", pady=(4, 0))
+        ttk.Button(row, text="Save", command=self._rep_save).pack(side="left")
+        ttk.Button(row, text="Default", command=self._rep_default).pack(side="left", padx=6)
+        self.rep_state = tk.Label(row, text="", bg=BG, fg=DIM, font=UI_FONT, anchor="w")
+        self.rep_state.pack(side="left", padx=6)
+        self._rep_fill()
+        self.rep_list.selection_set(0)
+        self._rep_pick()
+        return f
+
+    def _rep_fill(self):
+        sel = self.rep_list.curselection()
+        self.rep_list.delete(0, "end")
+        for key, label in sl.REPLY_LABELS:
+            mark = "*" if self.rep_text[key] != self.rep_saved[key] else (
+                "+" if self.rep_saved[key] != sl.DEFAULT_REPLIES[key] else " ")
+            self.rep_list.insert("end", f"{mark} {label}")
+        for i in sel:
+            self.rep_list.selection_set(i)
+
+    def _rep_pick(self):
+        sel = self.rep_list.curselection()
+        if not sel:
+            return
+        self.rep_cur = sl.REPLY_LABELS[sel[0]][0]
+        self.rep_edit.delete("1.0", "end")
+        self.rep_edit.insert("1.0", self.rep_text[self.rep_cur])
+        self.rep_edit.edit_modified(False)
+        self._rep_status()
+
+    def _rep_typed(self, ev=None):
+        if not self.rep_edit.edit_modified() or not self.rep_cur:
+            return
+        self.rep_edit.edit_modified(False)
+        self.rep_text[self.rep_cur] = self.rep_edit.get("1.0", "end-1c")
+        self._rep_fill()
+        self._rep_status()
+
+    def _rep_status(self):
+        unsaved = sum(self.rep_text[k] != self.rep_saved[k] for k, _ in sl.REPLY_LABELS)
+        custom = sum(self.rep_saved[k] != sl.DEFAULT_REPLIES[k] for k, _ in sl.REPLY_LABELS)
+        self.rep_state.configure(text=(f"{unsaved} not saved   " if unsaved else "") +
+                                 f"{custom} custom   (+ custom, * changed; link is fixed)",
+                                 fg=AMBER if unsaved else DIM)
+
+    def _rep_default(self):
+        if self.rep_cur:
+            self.rep_edit.delete("1.0", "end")
+            self.rep_edit.insert("1.0", sl.DEFAULT_REPLIES[self.rep_cur])
+
+    def _rep_save(self):
+        keys = [k for k, _ in sl.REPLY_LABELS]
+        try:
+            kept = sl.save_replies(self.radio.storage, {k: self.rep_text[k] for k in keys})
+        except OSError as e:
+            return self.log(f"Replies not saved: {e}")
+        for k in keys:
+            if not self.rep_text[k].strip():
+                self.rep_text[k] = sl.DEFAULT_REPLIES[k]  # empty = default
+        self.rep_saved = dict(self.rep_text)
+        if self.radio.lx:
+            self.radio.lx.reload_replies()
+        self._rep_pick()
+        self._rep_fill()
+        self.log(f"Replies saved ({len(kept)} custom)")
 
     def _tab_log(self, nb):
         f = ttk.Frame(nb, padding=4)
@@ -374,6 +492,18 @@ class App:
         except (TypeError, ValueError):
             pass
         self.s["announce_every_min"] = self.radio.announce_every_min
+        try:
+            self.radio.lxmf_every_h = int(self.s["lxmf_every_h"])
+        except (TypeError, ValueError):
+            pass
+        self.s["lxmf_every_h"] = self.radio.lxmf_every_h
+        try:
+            self.radio.slots = max(0, min(99, int(self.s["slots"])))
+        except (TypeError, ValueError):
+            pass
+        self.s["slots"] = self.radio.slots
+        if bool(self.s["lxmf_on"]) != self.radio.lxmf_on:
+            self.radio.lxmf_on = bool(self.s["lxmf_on"])
 
     def _mix_changed(self):
         g = round(float(self.v_gain.get()) * 2) / 2
@@ -399,6 +529,14 @@ class App:
             every = self.s["announce_every_min"]
         every = max(rl.ANNOUNCE_MIN_EVERY, every) if every > 0 else 0
         try:
+            lx_every = max(rl.LXMF_MIN_EVERY_H, int(self.v_lxmf_every.get()))
+        except (ValueError, AttributeError):
+            lx_every = self.s["lxmf_every_h"]
+        try:
+            slots = max(0, min(99, int(self.v_slots.get())))
+        except (ValueError, AttributeError):
+            slots = self.s["slots"]
+        try:
             self.s.update({
                 "name": self.v_name.get(), "mode": self.v_mode.get(), "url": self.v_url.get(),
                 "folder": self.v_folder.get(), "shuffle": self.v_shuffle.get(),
@@ -407,6 +545,7 @@ class App:
                 "announce_every_min": every, "auto_start": self.v_auto.get(),
                 "gain_db": self.radio.gain_db, "limiter_on": self.radio.limiter_on,
                 "limiter_ceiling_db": self.radio.limiter.ceiling_db,
+                "lxmf_on": self.v_lxmf.get(), "lxmf_every_h": lx_every, "slots": slots,
             })
         except AttributeError:
             return  # widgets not built yet
@@ -444,10 +583,12 @@ class App:
         if self.tick % 4 == 0:
             self.tree.delete(*self.tree.get_children())
             for row in snap["rows"]:
+                sub = "✓" if row["sub"] else ""
                 if row["state"] == "listening":
-                    vals = (row["id"], row["profile"], hms(row["time"]), f"{row['kbps']:.1f}", row["lost"])
+                    vals = (row["id"], row["user"], sub, row["profile"], hms(row["time"]),
+                            f"{row['kbps']:.1f}", row["lost"])
                 else:
-                    vals = (row["id"], row["state"], "", "", "")
+                    vals = (row["id"], row["user"], sub, row["state"], "", "", "")
                 self.tree.insert("", "end", values=vals)
             self.lst_info.configure(text=f"Peak {snap['peak']}   Calls {snap['calls']}   "
                                          f"Sent {RNS.prettysize(snap['bytes'])}")
@@ -502,10 +643,10 @@ class App:
 
         lines = [
             f"CALL ID  {self.radio.identity_hash}",
-            f"LISTEN   {snap['listeners']:<3} PEAK {snap['peak']:<3} SENT {RNS.prettysize(snap['bytes'])}",
+            f"LISTEN   {(str(snap['listeners']) + (f'/{self.radio.slots}' if self.radio.slots else '')):<5} PEAK {snap['peak']:<3} SENT {RNS.prettysize(snap['bytes'])}",
             f"UPTIME   {hms(snap['uptime'])}   SRC {snap['source_state'].upper()}",
             f"PLAYING  {snap['now_playing'][:46]}" if snap["stamps_ready"] else
-            f"STAMPS   preparing {snap['stamps_done']}/3" + (", on air when ready" if snap["waiting"] else
+            f"STAMPS   preparing {snap['stamps_done']}/{snap['stamps_total']}" + (", on air when ready" if snap["waiting"] else
                                                           ", first start only"),
         ]
         for i, t in enumerate(lines):
