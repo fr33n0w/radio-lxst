@@ -2,7 +2,7 @@
 
 Internet radio over [Reticulum](https://reticulum.network). Put a web radio stream, a folder of music or a live sound card input on the air, and listeners tune in by **calling** the station, like a phone call, with [LXST](https://pypi.org/project/lxst/): from the radio-lxst client, Sideband or rnphone.
 
-Version 0.3 · [Reticulum License](LICENSE)
+Version 0.4 · [Reticulum License](LICENSE)
 
 | Server | Client |
 |---|---|
