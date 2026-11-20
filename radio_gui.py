@@ -14,7 +14,7 @@ import radio_lxst as rl
 import radio_client as rc
 import station_lxmf as sl
 from ui_common import (LCD_BOLD, BG, EDGE, LCD_BG, DIM, LCD, LCD_DIM, AMBER, UI_FONT, TITLE_FONT, LCD_FONT, LCD_BIG, hms,
-                       apply_style, volume_scale, draw_vu, draw_badge, LogBox, copy_text, context_menu, hash_of)
+                       apply_style, volume_scale, draw_vu, draw_badge, LogBox, copy_text, context_menu, hash_of, update_banner, about_tab, rns_watch, rns_lost)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SETTINGS = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.path.join(HERE, "settings.json")
@@ -45,7 +45,7 @@ class App:
         self.vu = [0.0, 0.0]
         self.flash = ("", 0)
 
-        root.title("radio-lxst")
+        root.title(f"RADIO-LXST STATION v{rl.__version__}")
         root.configure(bg=BG)
         root.minsize(720, 590)
         apply_style(root)
@@ -64,6 +64,8 @@ class App:
         self._build()
         root.protocol("WM_DELETE_WINDOW", self.quit)
         self.log(f"radio-lxst {rl.__version__} ready, identity {self.radio.identity_hash}")
+        update_banner(root, self.status, rl.__version__, self.log)
+        rns_watch(root, self.status)
         if self.s.get("auto_start"):
             root.after(500, self.go_on_air)
         self._update()
@@ -120,6 +122,7 @@ class App:
         nb.add(self._tab_output(nb), text="Output")
         nb.add(self._tab_replies(nb), text="Replies")
         nb.add(self._tab_log(nb), text="Log")
+        nb.add(about_tab(nb, "radio-lxst", rl.__version__), text="About")
         nb.enable_traversal()
 
         self.status = tk.Label(r, text="", bg=BG, fg=DIM, font=UI_FONT, anchor="w")
@@ -596,7 +599,7 @@ class App:
             na = snap["next_announce"]
             self.ann_info.configure(text=f"next announce in {hms(max(0, na))}" if na is not None else "")
             if time.time() > self.flash[1]:
-                self.status.configure(text=f"Reticulum ok   frames {rl.FRAME_MS} ms   "
+                self.status.configure(text=f"Reticulum {'LOST' if rns_lost() else 'ok'}   frames {rl.FRAME_MS} ms   "
                                            f"buffer {snap['buffer_ms'] / 1000:.1f} s   "
                                            f"send late {snap['late_ms']:.0f} ms", fg=DIM)
             self.radio.max_late = 0.0
@@ -626,7 +629,9 @@ class App:
         name = (self.radio.name or "radio-lxst")[:34]
         c.create_text(12, 18, text=name, anchor="w", fill=LCD if on else LCD_DIM, font=LCD_BIG)
         blink = (self.tick // 5) % 2 == 0
-        if snap["waiting"]:
+        if on and rns_lost():
+            draw_badge(c, w, "WAITING", True, blink, AMBER)
+        elif snap["waiting"]:
             draw_badge(c, w, "STAMPS", True, blink, AMBER)
         else:
             draw_badge(c, w, "ON AIR" if on else "OFF AIR", on, blink)

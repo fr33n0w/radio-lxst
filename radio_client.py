@@ -21,7 +21,7 @@ except Exception:
 
 from LXST.Codecs import Opus
 
-__version__ = "0.4"
+__version__ = "0.5"
 
 STATION_ASPECT = "radiolxst.station"
 FIELD_SIGNALLING = 0x00
@@ -709,6 +709,27 @@ class Client:
         }
 
 
+def lock_storage(storage):
+    """Only one client per storage folder: returns the lock (keep it open) or None if another client has it."""
+    os.makedirs(storage, exist_ok=True)
+    f = open(os.path.join(storage, "client.lock"), "a+")
+    try:
+        f.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return f
+    except OSError:
+        f.close()
+        return None
+
+
+ALREADY_OPEN = "radio-lxst client is already open (one client at a time for the same storage folder)"
+
+
 def load_identity(path):
     if os.path.isfile(path):
         return RNS.Identity.from_file(path)
@@ -733,8 +754,16 @@ def main():
                                                  "subscribe, unsubscribe) and print the reply")
     ap.add_argument("--rnsconfig", default=None)
     a = ap.parse_args()
+    lock = lock_storage(os.path.join(here, "storage"))
+    if lock is None:
+        sys.exit(ALREADY_OPEN)
 
     RNS.Reticulum(configdir=a.rnsconfig, loglevel=RNS.LOG_NOTICE)
+    import rns_watch
+    rns_watch.start()
+    import update_check
+    update_check.watch(__version__, lambda v: RNS.log(f"New version {v} on GitHub: {update_check.REPO_URL}",
+                                                      RNS.LOG_NOTICE))
     directory = Directory(os.path.join(here, "storage", "stations.json"))
     if a.cmd and a.call_id:
         import client_lxmf

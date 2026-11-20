@@ -15,7 +15,7 @@ import RNS
 import radio_client as rc
 import client_lxmf
 from ui_common import (BG, LCD, LCD_DIM, LCD_BG, AMBER, RED, DIM, UI_FONT, TITLE_FONT, LCD_FONT, LCD_BIG, LOG_FONT, LCD_BOLD, hms,
-                       apply_style, volume_scale, draw_vu, draw_badge, LogBox, copy_text, context_menu, hash_of)
+                       apply_style, volume_scale, draw_vu, draw_badge, LogBox, copy_text, context_menu, hash_of, update_banner, about_tab, rns_watch, rns_lost)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SETTINGS = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.path.join(HERE, "client_settings.json")
@@ -76,7 +76,7 @@ class App:
         self.dir_dirty = True
         self.flash = ("", 0)
 
-        root.title("radio-lxst client")
+        root.title(f"RADIO-LXST CLIENT v{rc.__version__}")
         root.configure(bg=BG)
         root.minsize(760, 600)
         apply_style(root)
@@ -99,6 +99,8 @@ class App:
         self._build()
         root.protocol("WM_DELETE_WINDOW", self.quit)
         self.log(f"radio-lxst client {rc.__version__} ready")
+        update_banner(root, self.status, rc.__version__, self.log)
+        rns_watch(root, self.status)
         if self.s.get("autoplay") and self.s["call_id"]:
             root.after(800, lambda: self.play("autoplay"))
         self._update()
@@ -160,6 +162,7 @@ class App:
         f = ttk.Frame(nb, padding=4)
         self.logbox = LogBox(f)
         nb.add(f, text="Log")
+        nb.add(about_tab(nb, "radio-lxst client", rc.__version__), text="About")
 
         self.status = tk.Label(r, text="", bg=BG, fg=DIM, font=UI_FONT, anchor="w", cursor="hand2")
         self.status.pack(fill="x", padx=10, pady=(0, 6))
@@ -220,8 +223,12 @@ class App:
         self.cmd_text.tag_configure("out", foreground=AMBER)
         self.cmd_text.tag_configure("dim", foreground=DIM)
         self.cmd_text.tag_configure("bad", foreground=RED)
-        self.cmd_addr = tk.Label(f, text="", bg=BG, fg=DIM, font=UI_FONT, anchor="w", cursor="hand2")
-        self.cmd_addr.pack(fill="x", pady=(4, 0))
+        arow = ttk.Frame(f)
+        arow.pack(fill="x", pady=(4, 0))
+        self.b_ann = ttk.Button(arow, text="Announce", command=self._announce, state="disabled")
+        self.b_ann.pack(side="right")
+        self.cmd_addr = tk.Label(arow, text="", bg=BG, fg=DIM, font=UI_FONT, anchor="w", cursor="hand2")
+        self.cmd_addr.pack(side="left", fill="x", expand=True)
         self.cmd_sub = tk.Label(btns, text="", bg=BG, fg=DIM, font=UI_FONT)
         self.cmd_sub.pack(side="right", padx=8)
         self.cmd_addr.bind("<Button-1>", lambda ev: self.cmds and self.copied("LXMF address", self.cmds.address))
@@ -359,6 +366,12 @@ class App:
         if sel:
             self.copied("Call ID", sel[0])
 
+    def _announce(self):
+        # our LXMF address, so stations know our key before we message them
+        if self.cmds and self.cmds.announce_now():
+            self.log(f"Announcing LXMF address {self.cmds.address}")
+            self.dir_dirty = True
+
     def copied(self, what, text):
         copy_text(self.root, text)
         self.flash = (f"Copied {what}: {text}", time.time() + 3)
@@ -484,8 +497,11 @@ class App:
             self.cmd_addr.configure(text=f"Commands go from your LXMF address {self.cmds.address}  (click to copy)"
                                     if self.cmds else f"Commands: {self.cmds_wait}",
                                     fg=DIM if self.cmds else AMBER)
+            aw = self.cmds.announce_wait() if self.cmds else 0
+            self.b_ann.configure(text=f"Announce in {hms(aw)}" if aw else "Announce",
+                                 state="normal" if self.cmds and not aw else "disabled")
             if time.time() > self.flash[1]:
-                self.status.configure(text=f"Reticulum ok   stations {len(self.dir.stations)}   "
+                self.status.configure(text=f"Reticulum {'LOST' if rns_lost() else 'ok'}   stations {len(self.dir.stations)}   "
                                            f"client {self.client.identity.hash.hex()}", fg=DIM)
 
         if self.cmds_go:
@@ -559,6 +575,15 @@ class App:
 
 
 def main():
+    lock = rc.lock_storage(os.path.join(HERE, "storage"))
+    if lock is None:
+        print(rc.ALREADY_OPEN)
+        r = tk.Tk()
+        r.withdraw()
+        from tkinter import messagebox
+        messagebox.showinfo("radio-lxst client", rc.ALREADY_OPEN)
+        r.destroy()
+        sys.exit(1)
     root = tk.Tk()
     try:
         App(root)

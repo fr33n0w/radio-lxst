@@ -142,10 +142,152 @@ def context_menu(root, event, items):
         else:
             m.add_command(label=it[0], command=it[1])
             last_sep = False
-    try:
+    global _MENU
+    if _MENU is not None:  # one menu at a time
+        try:
+            _MENU.unpost()
+            _MENU.destroy()
+        except tk.TclError:
+            pass
+    _MENU = m
+    m.bind("<Escape>", lambda e: m.unpost())
+    if root.tk.call("tk", "windowingsystem") == "win32":
+        try:
+            m.tk_popup(event.x_root, event.y_root)
+        finally:
+            m.grab_release()
+    else:
+        # X11: tk_popup returns at once, the grab must stay or a click outside never closes the menu
         m.tk_popup(event.x_root, event.y_root)
-    finally:
-        m.grab_release()
+        root.after(400, _watch_menu, root, m, 0)
+
+
+def _watch_menu(root, m, misses):
+    # X11 menus are free windows: close it when the app loses focus (other desktop, other window)
+    try:
+        if not m.winfo_ismapped():
+            return
+        try:
+            focused = root.focus_get() is not None
+        except (KeyError, tk.TclError):
+            focused = True
+        misses = 0 if focused else misses + 1
+        if misses >= 2:
+            m.unpost()
+            m.grab_release()
+            return
+        root.after(250, _watch_menu, root, m, misses)
+    except tk.TclError:
+        pass
+
+
+_MENU = None
+
+
+def update_banner(root, before, current, log=None):
+    """Hidden bar shown above `before` when GitHub has a newer version; click opens the repo."""
+    import queue
+    import webbrowser
+    import update_check
+    found = queue.Queue()
+    bar = tk.Label(root, text="", bg=PANEL, fg=AMBER, font=UI_FONT, anchor="w", cursor="hand2", padx=8, pady=3)
+    bar.bind("<Button-1>", lambda ev: webbrowser.open(update_check.REPO_URL))
+
+    def poll():
+        try:
+            v = found.get_nowait()
+            bar.configure(text=f"radio-lxst {v} is out (you have {current}) - click to open {update_check.REPO_URL}")
+            if not bar.winfo_ismapped():
+                bar.pack(fill="x", padx=8, pady=(0, 4), before=before)
+            if log:
+                log(f"New version {v} on GitHub: {update_check.REPO_URL}")
+        except queue.Empty:
+            pass
+        root.after(2000, poll)
+    update_check.watch(current, found.put)
+    root.after(2000, poll)
+    return bar
+
+
+def rns_lost():
+    import rns_watch
+    return rns_watch.lost()
+
+
+def rns_watch(root, before):
+    """Red bar above `before` while the shared RNS instance is gone, green for 5 s when it is back."""
+    import time
+    import rns_watch as rw
+    rw.start()
+    bar = tk.Label(root, text="", bg=RED, fg="#ffffff", font=UI_FONT, anchor="w", padx=8, pady=3)
+    state = {"lost": False, "since": 0.0, "hide": 0.0}
+
+    def show():
+        if not bar.winfo_ismapped():
+            bar.pack(fill="x", padx=8, pady=(0, 4), before=before)
+
+    def poll():
+        lost = rw.lost()
+        now = time.time()
+        if lost and not state["lost"]:
+            state["since"] = now
+        elif not lost and state["lost"]:
+            bar.configure(bg="#1f8a3a", text=f"Reticulum shared instance back after {hms(now - state['since'])}"
+                                               " - network connection ready!")
+            state["hide"] = now + 5
+            show()
+        if lost:
+            bar.configure(bg=RED, text=f"Reticulum shared instance lost {hms(now - state['since'])} ago"
+                                       " - waiting to reconnect... (is the rnsd instance running?)")
+            state["hide"] = 0.0
+            show()
+        elif state["hide"] and now >= state["hide"]:
+            state["hide"] = 0.0
+            bar.pack_forget()
+        state["lost"] = lost
+        root.after(1000, poll)
+    root.after(1000, poll)
+    return bar
+
+
+def about_tab(nb, app, current):
+    """About tab: version, repo link, update check each time the tab is shown."""
+    import threading
+    import webbrowser
+    import update_check
+    f = ttk.Frame(nb, padding=16)
+    tk.Label(f, text=app, bg=PANEL, fg=LCD, font=TITLE_FONT).pack(pady=(8, 2))
+    tk.Label(f, text=f"version {current}", bg=PANEL, fg=TEXT, font=UI_FONT).pack()
+    tk.Label(f, text="internet radio over Reticulum (LXST)", bg=PANEL, fg=DIM, font=UI_FONT).pack(pady=(2, 12))
+    link = tk.Label(f, text=update_check.REPO_URL, bg=PANEL, fg=AMBER, font=UI_FONT, cursor="hand2")
+    link.pack()
+    link.bind("<Button-1>", lambda ev: webbrowser.open(update_check.REPO_URL))
+    status = tk.Label(f, text="", bg=PANEL, fg=DIM, font=UI_FONT)
+    status.pack(pady=(12, 0))
+    res = []
+
+    def show(v):
+        if v is None:
+            status.configure(text="update check failed (no internet?)", fg=DIM)
+        elif update_check.newer(v, current):
+            status.configure(text=f"new version {v} available - click the link above", fg=AMBER)
+        else:
+            status.configure(text=f"up to date (GitHub has {v})", fg=LCD)
+
+    def poll():
+        if res:
+            show(res.pop())
+        else:
+            f.after(300, poll)
+
+    def check(ev=None):
+        if status.cget("text").startswith("checking"):
+            return
+        status.configure(text="checking GitHub for updates...", fg=DIM)
+        threading.Thread(target=lambda: res.append(update_check.latest_version()), daemon=True).start()
+        f.after(300, poll)
+    f.bind("<Map>", check)
+    return f
 
 
 def hash_of(name, identity_hash_hex):

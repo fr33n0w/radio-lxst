@@ -2,7 +2,7 @@
 
 Internet radio over [Reticulum](https://reticulum.network). Put a web radio stream, a folder of music or a live sound card input on the air, and listeners tune in by **calling** the station, like a phone call, with [LXST](https://pypi.org/project/lxst/): from the radio-lxst client, Sideband or rnphone.
 
-Version 0.4 · [Reticulum License](LICENSE)
+Version 0.5 · [Reticulum License](LICENSE)
 
 | Server | Client |
 |---|---|
@@ -80,13 +80,15 @@ Client:
 - Double click a station to listen. **Refresh** asks the stations for their state now. "Play last station at start" resumes on launch.
 - Buffer: more seconds = fewer dropouts on slow paths.
 - Your name: sent to the station inside the call, shown in its listener list. Empty = `Radio-LXST Client #xxxx` (start of your identity hash).
-- **Commands**: pick a station and press help, info, status, link, subscribe or unsubscribe; the replies show below. They go over LXMF from the client identity (its address is at the bottom, click to copy) to the station's LXMF address, shown in the list. On-air messages reach the client while it is open: they show in the status bar and the Log for a while, and in Commands. The tab and the Sub column of Stations show if you are subscribed. The first start makes the announce stamp of the client's LXMF address in the background (STAMP on the display, a few minutes, once): the command buttons are grey until then.
+- **Commands**: pick a station and press help, info, status, link, subscribe or unsubscribe; the replies show below. They go over LXMF from the client identity (its address is at the bottom, click to copy) to the station's LXMF address, shown in the list. On-air messages reach the client while it is open: they show in the status bar and the Log for a while, and in Commands. The tab and the Sub column of Stations show if you are subscribed. **Clear** empties only the replies shown, the subscription stays (`storage/subscriptions.json`). The first start makes the announce stamp of the client's LXMF address in the background (STAMP on the display, a few minutes, once): the command buttons are grey until then. **Announce** (next to the address) sends the client's LXMF announce, so stations learn its key: once every 10 minutes at most.
 - If the first path is stale the client drops it and asks for a fresh one, then gives up. If the station is lost while playing (no audio for 20 s) it redials after 15, 30, 60 and 120 s; a station that stops on purpose is not redialed.
 
 Line input, for example from an SDR program:
 - Send the SDR audio to **CABLE Input** (VB-Audio Virtual Cable) and choose **CABLE Output**, or
 - leave it on the speakers and choose **Loopback: <your speakers>**: everything the PC plays goes on air.
 - On Linux the PulseAudio/PipeWire monitor sources work as loopback.
+
+Both windows check GitHub at start and every 12 hours: when a newer version is out, a bar above the status line says so, click it to open the repo. Nothing is installed by itself. The version is in the window title, and the About tab shows it with the repo link and a fresh update check. If the shared Reticulum instance (rnsd or the app running it) goes away, a red bar says so (green for 5 s when it is back) and the station badge blinks WAITING; the station stays on air and is back on the network as soon as the instance returns. Loss and return are written in the log, terminal versions too. The terminal server and client write the same notice in their log.
 
 Addresses are copied with a click: the CALL ID line on the display, the addresses in Output, right click on a station or a listener.
 
@@ -106,6 +108,8 @@ With LXMF on, the station answers messages sent to its LXMF address:
 
 The client sends them from its **Commands** tab, rBrowser from the Commands pane of its Radio tab.
 
+If the station has not heard the sender's announce yet, it asks the network for the sender's key first and then answers.
+
 At most 20 answers per sender per minute, one on-air message every 30 min at most. Messages, subscriptions and deliveries show up in the station log. Subscribers are kept in `storage/subscribers.json`.
 
 ## How it works
@@ -120,6 +124,16 @@ At most 20 answers per sender per minute, one on-air message every 30 min at mos
 - The caller's microphone is ignored.
 
 ## Changes
+
+- 0.5: Added update check on GitHub.
+- 0.5: Added About tab and version in title.
+- 0.5: Shows lost RNS shared instance.
+- 0.5: One client at a time.
+- 0.5: Station answers unknown senders.
+- 0.5: Fixed right click menu on Linux (thanks ant9000).
+- 0.5: Client log shows the LXMF address.
+- 0.5: Added client Announce button.
+- 0.5: Clear keeps subscriptions.
 
 - 0.4: Added LXMF autoresponder.
 - 0.4: Added subscribe for on-air messages.
@@ -155,9 +169,9 @@ At most 20 answers per sender per minute, one on-air message every 30 min at mos
 
 ## Files
 
-`radio_lxst.py` server engine and CLI, `station_lxmf.py` station messages, `radio_gui.py` server window, `radio_client.py` client engine and CLI, `client_lxmf.py` client commands, `radio_client_gui.py` client window, `ui_common.py` shared look.
+`radio_lxst.py` server engine and CLI, `station_lxmf.py` station messages, `radio_gui.py` server window, `radio_client.py` client engine and CLI, `client_lxmf.py` client commands, `radio_client_gui.py` client window, `ui_common.py` shared look, `update_check.py` new version check, `rns_watch.py` shared instance watch.
 
-Settings are saved next to the scripts (`settings.json`, `client_settings.json`), identities and the station list in `storage/`. The client GUI also writes `storage/client.log` (and `client_crash.log` if it ever crashes). Run one server per identity.
+Settings are saved next to the scripts (`settings.json`, `client_settings.json`), identities and the station list in `storage/`. The client GUI also writes `storage/client.log` (and `client_crash.log` if it ever crashes). Run one server per identity. Only one client at a time can use the same `storage/` folder: a second one (window or terminal) says so and does not start.
 
 ## Responsible use
 

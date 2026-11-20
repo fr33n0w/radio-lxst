@@ -24,7 +24,7 @@ except Exception:
 from LXST.Codecs import Opus
 from LXST.Codecs.libs.pyogg import opus, OpusEncoder
 
-__version__ = "0.4"
+__version__ = "0.5"
 
 APP_NAME = "lxst"
 ASPECT = "telephony"
@@ -899,6 +899,11 @@ def main():
     set_frame_ms(a.frame_ms)
 
     RNS.Reticulum(configdir=a.rnsconfig, loglevel=RNS.LOG_NOTICE + a.verbose)
+    import rns_watch
+    rns_watch.start()
+    import update_check
+    update_check.watch(__version__, lambda v: RNS.log(f"New version {v} on GitHub: {update_check.REPO_URL}",
+                                                      RNS.LOG_NOTICE))
     radio = Radio(load_identity(a.identity), a.name, storage=os.path.dirname(os.path.abspath(a.identity)),
                   lxmf_on=not a.no_lxmf)
     radio.slots = max(0, a.slots)

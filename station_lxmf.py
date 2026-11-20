@@ -16,6 +16,7 @@ NOTIFY_DELAY = 15        # after going on air: announces first, track name known
 NOTIFY_MIN_GAP = 1800    # on/off air flapping does not spam subscribers
 SEND_SPACING = 2         # seconds between outgoing messages
 PATH_WAIT = 20
+KEY_WAIT_MAX = 8         # unknown senders fetched at the same time
 REPO_URL = "https://github.com/fr33n0w/radio-lxst"
 STAMP_COST_MAX = 12     # costlier stamps would stall the audio thread, those replies are skipped
 
@@ -130,6 +131,7 @@ class StationLXMF:
         self.lock = threading.Lock()
         self.subs = self._load()
         self.recent = {}
+        self.key_wait = set()  # senders whose key is being fetched
         self.last_notify = 0
         self.outq = queue.Queue()
         threading.Thread(target=self._send_loop, daemon=True).start()
@@ -175,8 +177,40 @@ class StationLXMF:
             return
         src = m.source_hash
         if not m.signature_validated:
-            RNS.log(f"LXMF from {src.hex()} not verified (unknown sender key), not answered", RNS.LOG_NOTICE)
+            if m.unverified_reason == LXMF.LXMessage.SOURCE_UNKNOWN and m.packed:
+                with self.lock:
+                    busy = src in self.key_wait or len(self.key_wait) >= KEY_WAIT_MAX
+                    if not busy:
+                        self.key_wait.add(src)
+                if not busy:
+                    RNS.log(f"LXMF from {src.hex()}: sender key unknown, asking the network", RNS.LOG_NOTICE)
+                    threading.Thread(target=self._fetch_key, args=(m,), daemon=True).start()
+                    return
+            RNS.log(f"LXMF from {src.hex()} not verified, not answered", RNS.LOG_NOTICE)
             return
+        self._handle(m)
+
+    def _fetch_key(self, m):
+        # the path answer carries the sender's announce, so its key: then check the signature again
+        src = m.source_hash
+        try:
+            RNS.Transport.request_path(src)
+            t = time.time()
+            while RNS.Identity.recall(src) is None and time.time() - t < PATH_WAIT:
+                time.sleep(1)
+            m2 = LXMF.LXMessage.unpack_from_bytes(m.packed, m.method)
+            if not m2.signature_validated:
+                RNS.log(f"LXMF from {src.hex()} not verified (sender key not found), not answered", RNS.LOG_NOTICE)
+                return
+            self._handle(m2)
+        except Exception as e:
+            RNS.log(f"LXMF from {src.hex()}: key check failed: {e}", RNS.LOG_ERROR)
+        finally:
+            with self.lock:
+                self.key_wait.discard(src)
+
+    def _handle(self, m):
+        src = m.source_hash
         name = lxmf_name(src)
         text = (m.content_as_string() or "").strip()
         RNS.log(f"LXMF from {who(src, name)}: {text[:60]!r}", RNS.LOG_NOTICE)

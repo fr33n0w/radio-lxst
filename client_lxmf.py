@@ -14,6 +14,7 @@ COMMANDS = ("help", "info", "status", "link", "subscribe", "unsubscribe")
 KEEP = 60               # lines kept per station
 FIRST_SEND_DELAY = 3    # after our first announce: the station needs our key to trust the message
 REPLY_WAIT = 90
+ANNOUNCE_GAP = 600      # Announce button: one every 10 min at most
 
 
 def subscription(rows):
@@ -96,6 +97,14 @@ class Commands:
         self.path = os.path.join(storage, "commands.json")
         self.lock = threading.Lock()
         self.lines = self._load()
+        # subscriptions kept apart from the transcript: Clear empties only the transcript
+        self.subs_path = os.path.join(storage, "subscriptions.json")
+        self.subs = self._load_subs()
+        for cid, rows in self.lines.items():
+            s = subscription(rows)
+            if s is not None and cid not in self.subs:
+                self.subs[cid] = s
+        self._save_subs()
         self.revision = 0
         self.on_change = None
         self.on_notice = None  # (call_id, text): a message that answers no command, like the on-air one
@@ -116,6 +125,17 @@ class Commands:
         self.announced = time.time()
         RNS.log(f"LXMF address {self.address} announced", RNS.LOG_NOTICE)
 
+    def announce_wait(self):
+        """Seconds before Announce is allowed again (one every ANNOUNCE_GAP), 0 = now."""
+        return max(0, int(self.announced + ANNOUNCE_GAP - time.time())) if self.announced else 0
+
+    def announce_now(self):
+        if self.announce_wait():
+            return False
+        self.announced = time.time()  # blocks a double click while the thread starts
+        threading.Thread(target=self.announce, daemon=True).start()
+        return True
+
     # transcript: {call_id: [{"t", "dir", "text", "state"}]}
     def _load(self):
         try:
@@ -134,6 +154,23 @@ class Commands:
         except OSError:
             pass
 
+    def _load_subs(self):
+        try:
+            with open(self.subs_path, encoding="utf-8") as f:
+                d = json.load(f)
+            return {k: bool(v) for k, v in d.items() if len(k) == 32}
+        except Exception:
+            return {}
+
+    def _save_subs(self):
+        try:
+            tmp = self.subs_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.subs, f, indent=1)
+            os.replace(tmp, self.subs_path)
+        except OSError:
+            pass
+
     def _add(self, call_id, direction, text, state=""):
         line = {"t": time.time(), "dir": direction, "text": text, "state": state}
         with self.lock:
@@ -141,6 +178,11 @@ class Commands:
             rows.append(line)
             del rows[:-KEEP]
             self._save()
+            if direction == "in":
+                s = subscription(rows)
+                if s is not None and self.subs.get(call_id) is not s:
+                    self.subs[call_id] = s
+                    self._save_subs()
             self.revision += 1
         self._changed()
         return line
@@ -165,7 +207,9 @@ class Commands:
 
     def subscribed(self, call_id):
         """True/False from the last subscribe/unsubscribe the station answered, None if never asked."""
-        return subscription(self.transcript(call_id))
+        s = subscription(self.transcript(call_id))
+        with self.lock:
+            return s if s is not None else self.subs.get(call_id)
 
     def clear(self, call_id):
         with self.lock:
@@ -209,7 +253,7 @@ class Commands:
         m.register_failed_callback(lambda msg: self._set_state(call_id, line, "failed"))
         self.router.handle_outbound(m)
         self._set_state(call_id, line, "sent")
-        RNS.log(f"Command {cmd!r} sent to {call_id}", RNS.LOG_NOTICE)
+        RNS.log(f"Command {cmd!r} sent to LXMF {out.hash.hex()} (station {call_id})", RNS.LOG_NOTICE)
 
     # in
     def _received(self, m):
