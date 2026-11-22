@@ -2,16 +2,16 @@
 
 Internet radio over [Reticulum](https://reticulum.network). Put a web radio stream, a folder of music or a live sound card input on the air, and listeners tune in by **calling** the station, like a phone call, with [LXST](https://pypi.org/project/lxst/): from the radio-lxst client, Sideband or rnphone.
 
-Version 0.5 · [Reticulum License](LICENSE)
+Version 0.6 · [Reticulum License](LICENSE)
 
 | Server | Client |
 |---|---|
 | ![server](screenshots/server.png) | ![client](screenshots/client.png) |
-| ![station replies](screenshots/server_replies.png) | ![client commands](screenshots/client_commands.png) |
+| ![station input](screenshots/server_input.png) | ![station playlist](screenshots/server_playlist.png) |
 
 ## What it does
 
-- **Server**: plays an existing stream (Icecast, Shoutcast, Zeno, any http audio) a folder (shuffle, next track) or a live input (mic, line in, VB-Cable, an SDR app, Loopback of what the PC plays), with volume and limiter. Many listeners at once, each on its own encrypted Reticulum Link (each one costs ~28 kbit/s of upload: set listener slots to cap it; when full, new callers get "busy"). Announces itself so clients can find it.
+- **Server**: plays an existing stream (Icecast, Shoutcast, Zeno, any http audio) a folder with its subfolders (shuffle, next track, fade, crossfade, beatmix, gap removal) or a live input (mic, line in, VB-Cable, an SDR app, Loopback of what the PC plays), with volume and limiter. Many listeners at once, each on its own encrypted Reticulum Link (each one costs ~28 kbit/s of upload: set listener slots to cap it; when full, new callers get "busy"). Announces itself so clients can find it.
 - **Client**: list of the stations heard on the network, a steady 3 s buffer, volume, output device, and the station's name, listeners and track during the call.
 - **Compatible**: any LXST phone (Sideband, rnphone) can listen too, it just calls the station's Call ID.
 
@@ -46,12 +46,17 @@ Server (also fine on a headless box):
 
 ```
 python radio_lxst.py --url https://example.com/live.mp3 --name "My Radio"
-python radio_lxst.py --folder ~/music --shuffle --name "My Radio"
+python radio_lxst.py --folder ~/music --shuffle --mix 5 --trim-silence --name "My Radio"
 python radio_lxst.py --list-inputs
 python radio_lxst.py --input "CABLE Output" --name "My Radio"
+python radio_lxst.py --settings settings.json   # same setup as the GUI
 ```
 
+Folder options: `--fade SEC` (fade in/out of each track), `--mix SEC` (crossfade, wins over fade between tracks), `--trim-silence` (cut the silence at start and end of tracks, and gaps longer than 20 s inside them), `--beatmix BEATS` (mix on the beat, see Beatmix below), `--loop-out`, `--loop-in`, `--loop BEATS`, `--loop-times N` (Beatmix loops), `--normalize LUFS` (same loudness for every track, -18 to -8).
+
 Options: `--slots N` (max listeners at once, 0 = no limit), `--announce-every MIN`, `--no-lxmf`, `--lxmf-every HOURS`, `--gain DB`, `--ceiling DBFS`, `--no-limiter`, `--frame-ms 60|120`, `--identity FILE`, `--rnsconfig DIR`.
+
+Same setup as the GUI: `python radio_lxst.py --settings settings.json` (options given on the line win). Relative paths in the file are taken from its folder. More stations at once: one settings file each, with its own `identity` (own Call ID and storage), started with `python radio_gui.py other.json` or `--settings other.json`. A second station on the same identity folder does not start.
 
 Client:
 
@@ -68,16 +73,18 @@ On Linux use `python3`.
 ## Using the GUIs
 
 Server:
-- **Input**: stream URL, folder or line input (pick the device from the list, **Refresh** after plugging one in). **Switch now** changes source on air, listeners stay connected.
-- **Output**: station name, quality, announce on air and every N minutes (20 at least), go on air at start. One announce every 10 minutes at most, Announce now included: one asked sooner waits for the 10 minutes and goes out if the station is still on air. Stop sends no announce. **LXMF**: autoresponder and subscriber messages on or off, LXMF address announced every N hours (1 at least, default 3).
+- **Input**: stream URL, folder or line input (pick the device from the list, **Refresh** after plugging one in). The folder is read with all its subfolders. **Fade in/out** (default 3 s), **Mix tracks** (crossfade, default 5 s, wins over fade between tracks) and **Remove gaps** change from the next track, also on air. **Beatmix** (experimental, not always in time: fine for fun, not for a real live show; 8 to 128 beats, default 32) tries to mix like a DJ when both tracks have a BPM: the next track starts on a bar of the one playing, stretched to its tempo (pitch kept, at most 8%), so the beats fall together: it comes up over the first half of the mix, the old one goes down over the second half; after the mix the new one slides back to its own tempo. Before each mix the start of the new track is test-rendered and its kicks lined up with the old one. **Loop out** repeats 4, 8 or 16 beats of the old track from the mix point, **Loop in** the first beats of the new one, 4, 8 or 16 times; then the new track goes on. **Next track** and **Play now** also beatmix, on the first bar 2 s or more ahead. Turned on while on air, it works from the end of the next track. While two tracks are mixed (Beatmix or Mix) the station progress bar blinks amber and both tracks turn amber in the Playlist. With Beatmix on, the Log gets one line per change of track (tempos, stretch, beats found, or why it fell back to Mix/Fade) and, after the mix, how far apart the kicks of the two tracks were heard; the same lines go to `storage/beatmix.jsonl`. Tracks without a BPM, or too far apart, get Mix or Fade. With Beatmix on, Remove gaps cuts only the start and the end of tracks with a BPM. With a folder the display shows a progress bar of the track (elapsed, time left and length, from ffprobe), the client shows it too, in time with what it plays. Click the station bar to jump in the track (not during a mix); a click at the very end lands just before the mix, to try mixes without waiting. With a stream or line input the box shows a scrolling text instead: `HTTP STREAM: name` (the stream icy-name, or the URL) or `LINE INPUT: device` on the station, `LIVE STREAMING: name` on the client (the stream name only, never the URL or the device). If the stream sends the track title (StreamTitle, read every 20 s) it is added: `Live streaming - title`, also in the client track line, status replies and on-air messages; otherwise plain `Live streaming`. **Switch now** changes source on air, listeners stay connected: the old source keeps playing while the new one connects (no gap), then they crossfade (Mix seconds, else Fade, else a quick cut).
+- **Playlist**: the tracks of the folder set in Input (subfolders included), the one on air marked ▶. Drag a track or use ▲ ▼ beside the list to move it, **Queue next** puts it after the one on air, **Play now** (or double click) fades to it (if the station is off it asks, then goes on air; does nothing while a stream or line input is on air; with **Ask before changing track on air** it asks first, also for **Next track now**), **Next track now** skips to the next one, **Shuffle** and **Sort** (drop-down: title, BPM, length, plays, not played yet, last played, random) reorder the list once, **Rescan** reads the folder again (and the added ones). **+ Files** and **+ Folder** add tracks from anywhere: they stay where they are, only the playlist keeps them; **Remove** takes the selected tracks out of the list, the files on disk are not touched (a track of the folder comes back if you add it again with **+ Files**). **Played** marks the tracks aired since the station started (**Set unplayed** clears the mark), **Plays** and **Last played** are kept in `storage/played.json`, **Length** in `storage/bpm.json`. **BPM** is measured in the background, one track at a time (numpy only, cached in `storage/bpm.json`); **Detect BPM** measures the selected tracks again. Changes work on air. Your order is saved in `storage/playlist.json` and used at every On air (also by the terminal server): new files go to the end, removed ones drop out. **Shuffle every round** in Input mixes the list again each time it starts over.
+- **Output**: station name, quality, announce on air and every N minutes (20 at least), go on air at start. One announce every 10 minutes at most, Announce now included: one asked sooner waits for the 10 minutes and goes out if the station is still on air. Stop asks for confirmation, then sends no announce. **LXMF**: autoresponder and subscriber messages on or off, LXMF address announced every N hours (1 at least, default 3).
 - **Replies**: edit what the station answers to each command (help, info, status, subscribe, unsubscribe, any other message, the on-air message). Placeholders like `{name}`, `{listeners}`, `{now_playing}` are filled when sent. Empty or **Default** = the built-in text. `link` is fixed: it always sends the addresses and the link to this repo. Saved in `storage/replies.json`, used by the terminal server too.
 - **Listeners**: who is tuned in (with the name from their LXMF announce, when known, and a ✓ in Sub if subscribed), quality, time, kbit/s.
 - Volume and limiter work live; the display shows how much the limiter pulls down.
+- **Normalize** (folder only): every track is brought to the same loudness, -18 to -8 LUFS (-14 like streaming services, -8 for a hotter master). The loudness of each track is measured in the background with the BPM; it changes from the next track. Quiet tracks are raised at most 12 dB, the limiter holds the peaks, so near -8 the result can stay a little under the target.
 - **MON** on the display: hear what goes on air on this PC (choose the device in Output > Monitor).
 - Meters have a dB scale; the amber line is the limiter ceiling.
 
 Client:
-- Double click a station to listen. **Refresh** asks the stations for their state now. "Play last station at start" resumes on launch.
+- Double click a station to listen. **Refresh** asks the stations for their state now. "Play last station at start" resumes on launch. **Mute** silences the audio and keeps the station connected. "Retry on hang up" (on by default, `--reconnect` in the terminal client) tries 3 times when the station closes the call (at once if it announces again), then shows it offline.
 - Buffer: more seconds = fewer dropouts on slow paths.
 - Your name: sent to the station inside the call, shown in its listener list. Empty = `Radio-LXST Client #xxxx` (start of your identity hash).
 - **Commands**: pick a station and press help, info, status, link, subscribe or unsubscribe; the replies show below. They go over LXMF from the client identity (its address is at the bottom, click to copy) to the station's LXMF address, shown in the list. On-air messages reach the client while it is open: they show in the status bar and the Log for a while, and in Commands. The tab and the Sub column of Stations show if you are subscribed. **Clear** empties only the replies shown, the subscription stays (`storage/subscriptions.json`). The first start makes the announce stamp of the client's LXMF address in the background (STAMP on the display, a few minutes, once): the command buttons are grey until then. **Announce** (next to the address) sends the client's LXMF announce, so stations learn its key: once every 10 minutes at most.
@@ -125,6 +132,50 @@ At most 20 answers per sender per minute, one on-air message every 30 min at mos
 
 ## Changes
 
+- 0.6: Folder reads subfolders.
+- 0.6: Added fade, crossfade, gap removal.
+- 0.6: Added track progress bar.
+- 0.6: Scrolling live text for streams.
+- 0.6: Shows the stream track title.
+- 0.6: Crossfade on source switch.
+- 0.6: Added Playlist tab.
+- 0.6: Added played marks.
+- 0.6: Added BPM detection.
+- 0.6: More playlist sort options.
+- 0.6: Added play counts and lengths.
+- 0.6: Play now starts the station.
+- 0.6: Optional confirm before track change.
+- 0.6: Shows CPU and RAM use.
+- 0.6: Added Beatmix (experimental).
+- 0.6: Shows track time left.
+- 0.6: Bar blinks during mixes.
+- 0.6: Mixing tracks amber in Playlist.
+- 0.6: Added Beatmix log.
+- 0.6: Added Normalize.
+- 0.6: Fixed clipping in mixes.
+- 0.6: Beatmix aligns kicks better.
+- 0.6: Track on air in bold.
+- 0.6: Add files and folders to Playlist.
+- 0.6: Terminal reads GUI settings.
+- 0.6: One station per identity.
+- 0.6: Fixed gap at track change.
+- 0.6: Fixed jump at track change.
+- 0.6: Beatmix test-renders each mix.
+- 0.6: Added Beatmix loop out/in.
+- 0.6: Beatmix kicks closer together.
+- 0.6: Fixed beatmix of same-BPM tracks.
+- 0.6: Fixed mono/surround output in client.
+- 0.6: Stop asks before going off air.
+- 0.6: Client sees stations back on air.
+- 0.6: Added Retry on hang up.
+- 0.6: Added Mute to the client.
+- 0.6: Fixed client giving up after one retry.
+- 0.6: Fixed shaking window on long titles.
+- 0.6: Click the bar to seek.
+- 0.6: Beatmix follows tempo changes in DJ sets.
+- 0.6: Beatmix not fooled by off-beat bass.
+- 0.6: Smoother beatmix fades.
+
 - 0.5: Added update check on GitHub.
 - 0.5: Added About tab and version in title.
 - 0.5: Shows lost RNS shared instance.
@@ -169,7 +220,7 @@ At most 20 answers per sender per minute, one on-air message every 30 min at mos
 
 ## Files
 
-`radio_lxst.py` server engine and CLI, `station_lxmf.py` station messages, `radio_gui.py` server window, `radio_client.py` client engine and CLI, `client_lxmf.py` client commands, `radio_client_gui.py` client window, `ui_common.py` shared look, `update_check.py` new version check, `rns_watch.py` shared instance watch.
+`radio_lxst.py` server engine and CLI, `station_lxmf.py` station messages, `radio_gui.py` server window, `radio_client.py` client engine and CLI, `client_lxmf.py` client commands, `radio_client_gui.py` client window, `ui_common.py` shared look, `update_check.py` new version check, `bpm.py` BPM detection, `rns_watch.py` shared instance watch.
 
 Settings are saved next to the scripts (`settings.json`, `client_settings.json`), identities and the station list in `storage/`. The client GUI also writes `storage/client.log` (and `client_crash.log` if it ever crashes). Run one server per identity. Only one client at a time can use the same `storage/` folder: a second one (window or terminal) says so and does not start.
 

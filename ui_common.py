@@ -76,6 +76,9 @@ def apply_style(root):
     st.configure("TButton", background=EDGE, foreground=TEXT, padding=(10, 3))
     st.map("TButton", background=[("active", "#5c5c70"), ("disabled", PANEL)],
            foreground=[("disabled", DIM)])
+    st.configure("TMenubutton", background=EDGE, foreground=TEXT, arrowcolor=TEXT, padding=(10, 3),
+                 anchor="center")
+    st.map("TMenubutton", background=[("active", "#5c5c70")])
     st.configure("Air.TButton", foreground=LCD)
     st.configure("Stop.TButton", foreground=RED)
     st.configure("Treeview", background=LCD_BG, fieldbackground=LCD_BG, foreground=LCD,
@@ -111,6 +114,38 @@ def draw_vu(c, w, levels, on, ceiling_db=None):
     if ceiling_db is not None:
         y = _vu_y(ceiling_db)
         c.create_line(x0 - 3, y, x0 + 67, y, fill=AMBER)
+
+
+def _mss(s):
+    s = int(s)
+    return f"{s // 3600}:{s // 60 % 60:02d}:{s % 60:02d}" if s >= 3600 else f"{s // 60}:{s % 60:02d}"
+
+
+def draw_progress(c, x0, x1, y, progress, on, live="", step=0, mixing=False):
+    """Player style bar of the track: elapsed, bar, length. progress = (pos, length) or None.
+    No length but a live text: the text scrolls inside the box (step = animation counter).
+    mixing: drawn in amber (the caller blinks it while two tracks are mixed)."""
+    if not progress and live and on:
+        c.create_rectangle(x0, y - 7, x1, y + 7, outline=LCD_DIM)
+        from tkinter import font as tkfont
+        cw = max(1, tkfont.nametofont(LCD_SMALL).measure("0"))
+        n = max(1, (x1 - x0 - 8) // cw)
+        loop = live + "   ·   "
+        loop = loop * (n // len(loop) + 2)
+        off = step % len(live + "   ·   ")
+        c.create_text(x0 + 4, y, text=loop[off:off + n], anchor="w", fill=LCD, font=LCD_SMALL)
+        return
+    col = AMBER if mixing and on else (LCD if on and progress else LCD_DIM)
+    pos, dur = progress if progress else (0, 0)
+    # right: time left, then length
+    left, right = (_mss(pos), f"-{_mss(max(0, dur - pos))} / {_mss(dur)}") if progress else ("-:--", "-:--")
+    lt = c.create_text(x0, y, text=left, anchor="w", fill=col, font=LCD_SMALL)
+    rt = c.create_text(x1, y, text=right, anchor="e", fill=col, font=LCD_SMALL)
+    bx0, bx1 = max(x0 + 40, c.bbox(lt)[2] + 8), min(x1 - 40, c.bbox(rt)[0] - 8)
+    c.create_rectangle(bx0, y - 3, bx1, y + 3, outline=AMBER if mixing and on else LCD_DIM)
+    if progress and dur > 0:
+        c.create_rectangle(bx0, y - 3, bx0 + (bx1 - bx0) * min(1.0, pos / dur), y + 3, outline="", fill=col)
+    return bx0, bx1
 
 
 def draw_badge(c, w, text, on, blink, color=RED):

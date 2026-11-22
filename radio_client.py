@@ -21,7 +21,7 @@ except Exception:
 
 from LXST.Codecs import Opus
 
-__version__ = "0.5"
+__version__ = "0.6"
 
 STATION_ASPECT = "radiolxst.station"
 FIELD_SIGNALLING = 0x00
@@ -41,6 +41,7 @@ PATH_WAIT = 20                  # seconds for a path answer
 ANSWER_WAIT = 30                # seconds for the station to answer
 DIAL_TRIES = 2                  # second try drops the path first: the first one can be stale
 RETRY_WAITS = (15, 30, 60, 120)  # pauses before redialing after a drop while playing
+HANGUP_WAITS = (15, 30, 60)     # same after the station hung up, if reconnect is on
 NO_AUDIO_S = 20                 # playing but no audio this long = lost (RNS notices a dead link much later)
 STEADY_S = 60                   # this much good listening resets the retry count
 STATUS_EVERY = 180              # seconds between status requests to one station
@@ -132,6 +133,19 @@ def list_devices():
     return com_call(job) or []
 
 
+def fit_channels(f, ch):
+    """Stereo frame -> device channel count (mono sink = average, surround = L/R on the front pair)."""
+    ch = ch if isinstance(ch, int) else len(ch)
+    if ch == f.shape[1]:
+        return f
+    if ch == 1:
+        return f.mean(axis=1, keepdims=True)
+    out = np.zeros((f.shape[0], ch), dtype=f.dtype)
+    n = min(ch, f.shape[1])
+    out[:, :n] = f[:, :n]
+    return out
+
+
 class Player:
     """Jitter buffer + sound card output. Starts after `prefill` seconds of audio, rebuffers on underrun."""
 
@@ -140,6 +154,7 @@ class Player:
         self.max_extra = max_extra
         self.device = device
         self.volume_db = 0.0
+        self.muted = False
         self.frames = deque()
         self.buffered = 0
         self.lock = threading.Lock()
@@ -224,11 +239,13 @@ class Player:
                     self.levels = (0.0, 0.0)
                     target = max(0.5, self.prefill / 2)  # refill faster after a dropout
                     continue
-                if self.volume_db:
+                if self.muted:
+                    f = np.zeros_like(f)  # still paced and consumed: unmute is live, no delay
+                elif self.volume_db:
                     f = np.clip(f * 10 ** (self.volume_db / 20), -1.0, 1.0)
                 peak = np.abs(f).max(axis=0)
                 self.levels = (float(peak[0]), float(peak[-1]))
-                player.play(f.astype(np.float32))
+                player.play(fit_channels(f, getattr(player, "channels", CHANNELS)).astype(np.float32))
 
 
 def announce_emitted(destination_hash):
@@ -276,6 +293,7 @@ class Directory:
         self.path = path
         self.stations = {}
         self.on_change = None
+        self.on_heard = None  # (call_id): a station really spoke (new announce)
         self._busy = set()
         self._busy_lock = threading.Lock()
         try:
@@ -329,6 +347,8 @@ class Directory:
             self.save()
             if callable(self.on_change):
                 self.on_change()
+            if callable(self.on_heard):
+                self.on_heard(cid)
         except Exception as e:
             RNS.log(f"Bad station announce: {e}", RNS.LOG_DEBUG)
 
@@ -364,7 +384,8 @@ class Directory:
 
     def _check(self, s):
         try:
-            st = ask_status(s.call_id)
+            # first failure only: later tries already ask a fresh path, no extra path requests for dead stations
+            st = ask_status(s.call_id, drop_stale=s.now_playing != "no reply")
             if st == NO_ANSWER:
                 # link up, request not answered: a station before 0.4 (or busy), keep what we know
                 RNS.log(f"Station {s.name or s.call_id}: link ok, no status answer", RNS.LOG_INFO)
@@ -397,9 +418,9 @@ class Directory:
         return s.name if s else ""
 
 
-def ask_status(call_id, timeout=STATUS_TIMEOUT):
+def ask_status(call_id, timeout=STATUS_TIMEOUT, drop_stale=False):
     """The station's live state (dict of the in-call info), NO_ANSWER if the link came up but the request
-    was not answered, None if the station cannot be reached."""
+    was not answered, None if the station cannot be reached (drop_stale: then forget the path, it may be old)."""
     try:
         ident_hash = bytes.fromhex(call_id)
         dh = RNS.Destination.hash_from_name_and_identity(STATION_ASPECT, ident_hash)
@@ -420,6 +441,8 @@ def ask_status(call_id, timeout=STATUS_TIMEOUT):
         while link.status != RNS.Link.ACTIVE and link.status != RNS.Link.CLOSED and time.time() < end:
             time.sleep(0.1)
         if link.status != RNS.Link.ACTIVE:
+            if drop_stale:
+                drop_path(dh)
             return None
         link.request("status", None, response_callback=lambda r: (box.append(r.response), done.set()),
                      failed_callback=lambda r: done.set(), timeout=max(1.0, end - time.time()))
@@ -454,6 +477,9 @@ class Client:
         self._gen = 0
         self.meta = {}
         self.retries = 0
+        self.waits = RETRY_WAITS
+        self.reconnect = False  # station hung up: try HANGUP_WAITS times before calling it offline
+        self._back = 0.0  # when the station spoke again while we retry after its hang up: try now
         self.last_audio = 0.0
         self._retry_lock = threading.Lock()
         self._lock = threading.RLock()  # tune/hangup vs packets of the old link
@@ -485,10 +511,12 @@ class Client:
             self.call_id = call_id.strip().lower()
             self.station_name = name
             self.meta = {}
+            self.prev_meta = ({}, 0)
+            self.np_heard_at = 0
         RNS.log(f"Tuning to {self.call_id}" + (f" ({why})" if why else ""), RNS.LOG_NOTICE)
         if profile is not None:
             self.profile = profile
-        self.retries = 0
+        self.retries, self.waits, self._back = 0, RETRY_WAITS, 0.0
         self.state, self.message = "searching", "looking for a path"
         threading.Thread(target=self._dial, args=(gen,), daemon=True).start()
 
@@ -502,8 +530,11 @@ class Client:
             return
         dh = RNS.Destination.hash_from_name_and_identity("lxst.telephony", ident_hash)
         why = None
-        for i in range(DIAL_TRIES):
-            why = self._attempt(gen, dh, fresh=i > 0)
+        hung = self.retries and self.waits is HANGUP_WAITS  # one try per retry, fresh path from the second
+        for i in range(1 if hung else DIAL_TRIES):
+            why = self._attempt(gen, dh, fresh=i > 0 or (hung and self.retries > 1))
+            if why == "station off air":
+                break  # after a hang up: off air now, maybe back on air in a moment
             if why in (None, "ok", "rejected"):
                 return
         if self.retries:
@@ -513,6 +544,7 @@ class Client:
 
     def _attempt(self, gen, dh, fresh):
         """One try: path (a fresh one if asked) + call. Returns ok, rejected, a failure reason, or None if cancelled."""
+        self._back = 0.0
         if fresh:
             self.state, self.message = "searching", "asking for a fresh path"
             drop_path(dh)
@@ -543,6 +575,9 @@ class Client:
         t = time.time()
         while gen == self._gen and self.state in ("connecting", "ringing") and time.time() - t < ANSWER_WAIT \
                 and link.status != RNS.Link.CLOSED:
+            if self.state == "connecting" and self._back > t:
+                RNS.log("The station is back: trying again now", RNS.LOG_NOTICE)
+                break  # this link went out on the old path, the station just spoke on a new one
             time.sleep(0.2)
         if gen != self._gen:
             return None
@@ -550,12 +585,13 @@ class Client:
             return "ok"
         if self.state == "failed":
             return "rejected"
+        off_air = self.state == "retrying" and self.message == "station off air"
         self.link = None
         try:
             link.teardown()
         except Exception:
             pass
-        return "no answer"
+        return "station off air" if off_air else "no answer"
 
     def _signal(self, link, signals):
         RNS.Packet(link, mp.packb({FIELD_SIGNALLING: signals}), create_receipt=False).send()
@@ -589,7 +625,14 @@ class Client:
                 RNS.log(f"Tuned in to {self.station_name or self.call_id}", RNS.LOG_NOTICE)
         meta = msg.get(FIELD_META)
         if isinstance(meta, dict):
-            self.meta = meta
+            if meta.get("np") != self.meta.get("np"):
+                self.prev_meta = (self.meta, getattr(self, "meta_t", 0))  # still heard until the buffer plays out
+                try:
+                    late = max(0.0, -float(meta.get("tp") or 0))  # the new track starts later at the station
+                except (TypeError, ValueError):
+                    late = 0.0
+                self.np_heard_at = time.monotonic() + self.player.buffer_s + late
+            self.meta, self.meta_t = meta, time.monotonic()
             if meta.get("n"):
                 self.station_name = str(meta["n"])[:48]
         for s in msg.get(FIELD_SIGNALLING, []) if isinstance(msg.get(FIELD_SIGNALLING), list) else []:
@@ -598,7 +641,10 @@ class Client:
                 full = f" ({m['l']}/{m['s']})" if m.get("s") and m.get("l") is not None else ""
                 self._fail(f"station full{full}, try later")
             elif s == STATUS_REJECTED:
-                self._fail("station off air")
+                if self.retries and self.waits is HANGUP_WAITS:
+                    self.state, self.message = "retrying", "station off air"  # keep trying after a hang up
+                else:
+                    self._fail("station off air")
         frames = msg.get(FIELD_FRAMES)
         if frames is not None:
             for f in frames if isinstance(frames, list) else [frames]:
@@ -624,14 +670,20 @@ class Client:
             self._schedule_retry(gen, "lost the station", link)
             return
         RNS.log("Station closed the link", RNS.LOG_NOTICE)
+        if self.reconnect:
+            self.retries, self.waits = 0, HANGUP_WAITS
+            self._schedule_retry(gen, "the station hung up", link)
+            return
         self.state, self.message = "ended", "the station hung up"
 
     def _watch(self, gen, link):
         while gen == self._gen and self.link is link and self.state == "playing":
             time.sleep(1)
+            if gen != self._gen or self.link is not link or self.state != "playing":
+                return  # dropped while asleep: the retry count is not ours to reset any more
             now = time.time()
             if self.retries and now - self.started > STEADY_S:
-                self.retries = 0
+                self.retries, self.waits = 0, RETRY_WAITS
             if now - self.last_audio > NO_AUDIO_S and gen == self._gen and self.link is link:
                 RNS.log(f"No audio for {NO_AUDIO_S} s", RNS.LOG_NOTICE)
                 self._schedule_retry(gen, "no audio from the station", link)
@@ -642,11 +694,18 @@ class Client:
         with self._retry_lock:
             if gen != self._gen or (dropped is not None and dropped is not self.link):
                 return  # cancelled, or this drop is already being handled
-            if self.retries >= len(RETRY_WAITS):
-                self._fail(f"{why}, gave up after {len(RETRY_WAITS)} retries")
+            if self.retries >= len(self.waits) and not self._back:
+                if self.waits is HANGUP_WAITS:
+                    # tried enough: say what the station really is now
+                    self._fail("station off air" if why == "station off air" else "station offline")
+                else:
+                    self._fail(f"{why}, gave up after {len(self.waits)} retries")
                 return
-            wait = RETRY_WAITS[self.retries]
-            self.retries += 1
+            if self.retries >= len(self.waits):
+                wait = 0  # out of retries, but the station just spoke: one more, now
+            else:
+                wait = self.waits[self.retries]
+                self.retries += 1
             link, self.link = self.link, None
             self.state = "retrying"
         if link:
@@ -656,19 +715,25 @@ class Client:
                 pass
         self.player.stop()
         self.state = "retrying"
-        RNS.log(f"{why}: retry {self.retries}/{len(RETRY_WAITS)} in {wait} s", RNS.LOG_NOTICE)
+        RNS.log(f"{why}: retry {self.retries}/{len(self.waits)} in {wait} s", RNS.LOG_NOTICE)
         threading.Thread(target=self._retry, args=(gen, wait), daemon=True).start()
+
+    def station_back(self, call_id):
+        """An announce or on-air message from the station we retry after its hang up: no more waiting."""
+        if self.reconnect and self.waits is HANGUP_WAITS and self.retries and call_id == self.call_id \
+                and self.state in ("retrying", "searching", "connecting"):
+            self._back = time.time()
 
     def _retry(self, gen, wait):
         end = time.time() + wait
-        while time.time() < end:
+        while time.time() < end and not self._back:
             if gen != self._gen:
                 return
-            self.message = f"retry {self.retries}/{len(RETRY_WAITS)} in {end - time.time():.0f} s"
+            self.message = f"retry {self.retries}/{len(self.waits)} in {end - time.time():.0f} s"
             time.sleep(0.5)
         if gen != self._gen:
             return
-        self.state, self.message = "searching", f"retry {self.retries}/{len(RETRY_WAITS)}"
+        self.state, self.message = "searching", f"retry {self.retries}/{len(self.waits)}"
         self._dial(gen)
 
     def _fail(self, why):
@@ -694,14 +759,48 @@ class Client:
         if self.state not in ("idle", "failed"):
             self.state, self.message = "idle", ""
 
+    def _heard(self, meta, meta_t):
+        # raw position of a meta's track at the speaker: the station sends it buffer_s earlier
+        try:
+            tp, td = float(meta["tp"]), float(meta["td"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        return (tp + time.monotonic() - meta_t - self.player.buffer_s, td) if td > 0 else None
+
+    def shown_meta(self, meta):
+        """(meta, received at) of what is heard now: the old track or source until the new one reaches the speaker."""
+        prev, prev_t = getattr(self, "prev_meta", ({}, 0))
+        if prev.get("np") and time.monotonic() < getattr(self, "np_heard_at", 0):
+            return prev, prev_t
+        return meta, getattr(self, "meta_t", 0)
+
+    def heard_track(self, meta, meta_t):
+        """(track name, (position, length) or None) as heard here."""
+        cur = self._heard(meta, meta_t)
+        if self.state != "playing" or not cur:
+            return str(meta.get("np") or ""), None
+        return str(meta.get("np") or ""), (max(0.0, min(cur[1], cur[0])), cur[1])
+
+    def live_text(self, meta):
+        """Moving text for a live station (stream or line input), "" for files or when not playing."""
+        np_ = str(meta.get("np") or "")
+        if self.state != "playing" or not (np_ == "Live streaming" or np_.startswith("Live streaming - ")):
+            return ""
+        sn = str(meta.get("sn") or "").strip()[:64]
+        title = np_[len("Live streaming - "):].strip()
+        return (f"LIVE STREAMING: {sn}" if sn else "LIVE STREAMING") + (f" - {title}" if title else "")
+
     def snapshot(self):
         el = time.time() - self.started if self.started and self.state == "playing" else 0
         p = self.player
         with self._lock:
             cid, name, meta = self.call_id or "", self.station_name, self.meta
+        shown, shown_t = self.shown_meta(meta)
+        track, prog = self.heard_track(shown, shown_t)
         return {
             "state": self.state, "message": self.message, "call_id": cid,
-            "name": name, "listeners": meta.get("l"), "slots": meta.get("s") or 0, "track": str(meta.get("np") or ""),
+            "name": name, "listeners": meta.get("l"), "slots": meta.get("s") or 0, "track": track, "progress": prog,
+            "live": self.live_text(shown),
             "time": el, "kbps": self.bytes * 8 / el / 1000 if el > 1 else 0,
             "buffer_s": p.buffer_s, "player": p.state, "underruns": p.underruns, "levels": p.levels,
             "hops": (RNS.Transport.hops_to(self.link.destination.hash)
@@ -749,6 +848,8 @@ def main():
     ap.add_argument("--volume", type=float, default=0.0, help="dB")
     ap.add_argument("--device", default=None, help="output device (part of its name)")
     ap.add_argument("--identity", default=os.path.join(here, "storage", "client_identity"))
+    ap.add_argument("--reconnect", action="store_true",
+                    help=f"if the station hangs up, try {len(HANGUP_WAITS)} times before calling it offline")
     ap.add_argument("--nick", default="", help="your name shown by the station (default Radio-LXST Client #xxxx)")
     ap.add_argument("--cmd", default=None, help="send a command to the station (help, info, status, link, "
                                                  "subscribe, unsubscribe) and print the reply")
@@ -809,6 +910,8 @@ def main():
 
     cl = Client(load_identity(a.identity), prefill=a.buffer, device=a.device, nick=a.nick)
     cl.player.volume_db = a.volume
+    cl.reconnect = a.reconnect
+    directory.on_heard = cl.station_back
     cl.tune(a.call_id, PROFILES[a.quality], directory.name_of(a.call_id.lower()))
     try:
         while True:

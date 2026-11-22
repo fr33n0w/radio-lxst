@@ -15,13 +15,13 @@ import RNS
 import radio_client as rc
 import client_lxmf
 from ui_common import (BG, LCD, LCD_DIM, LCD_BG, AMBER, RED, DIM, UI_FONT, TITLE_FONT, LCD_FONT, LCD_BIG, LOG_FONT, LCD_BOLD, hms,
-                       apply_style, volume_scale, draw_vu, draw_badge, LogBox, copy_text, context_menu, hash_of, update_banner, about_tab, rns_watch, rns_lost)
+                       apply_style, volume_scale, draw_vu, draw_badge, draw_progress, LogBox, copy_text, context_menu, hash_of, update_banner, about_tab, rns_watch, rns_lost)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SETTINGS = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.path.join(HERE, "client_settings.json")
 DEFAULTS = {"call_id": "", "quality": "SHQ", "volume_db": 0.0, "buffer_s": 3.0, "device": "",
             "identity": os.path.join(HERE, "storage", "client_identity"), "rnsconfig": "", "autoplay": False,
-            "nick": ""}
+            "nick": "", "reconnect": True}
 BADGES = {"playing": ("PLAYING", LCD), "buffering": ("BUFFER", AMBER), "searching": ("SEARCH", AMBER),
           "retrying": ("RETRY", AMBER),
           "connecting": ("CONNECT", AMBER), "ringing": ("RINGING", AMBER), "failed": ("FAILED", RED),
@@ -74,6 +74,7 @@ class App:
         self.tick = 0
         self.vu = [0.0, 0.0]
         self.dir_dirty = True
+        self._marked_off = None  # call ID already marked off air for the current hang up
         self.flash = ("", 0)
 
         root.title(f"RADIO-LXST CLIENT v{rc.__version__}")
@@ -89,6 +90,7 @@ class App:
         self.dir.on_change = lambda: setattr(self, "dir_dirty", True)
         self.client = rc.Client(rc.load_identity(self.s["identity"]), float(self.s["buffer_s"]),
                                 self.s["device"] or None, nick=self.s.get("nick", ""))
+        self.dir.on_heard = self.client.station_back
         self.cmds = None
         self.cmds_wait = "preparing the LXMF address..."
         self.stamping = False
@@ -118,14 +120,16 @@ class App:
 
         lcd_wrap = tk.Frame(r, bg="#4b4b5c", padx=2, pady=2)
         lcd_wrap.pack(fill="x", padx=8, pady=6)
-        self.lcd = tk.Canvas(lcd_wrap, height=118, bg="#050805", highlightthickness=0)
+        self.lcd = tk.Canvas(lcd_wrap, height=130, bg="#050805", highlightthickness=0)
         self.lcd.pack(fill="x")
 
         bar = tk.Frame(r, bg=BG)
         bar.pack(fill="x", padx=8)
         ttk.Button(bar, text="▶  Play", style="Air.TButton", command=lambda: self.play("Play button")).pack(side="left", padx=(0, 6))
         self.b_stop = ttk.Button(bar, text="■  Stop", style="Stop.TButton", command=self.stop)
-        self.b_stop.pack(side="left", padx=(0, 10))
+        self.b_stop.pack(side="left", padx=(0, 6))
+        self.b_mute = ttk.Button(bar, text="Mute", width=7, command=self.toggle_mute)
+        self.b_mute.pack(side="left", padx=(0, 10))
         tk.Label(bar, text="Call ID", bg=BG, fg=DIM, font=UI_FONT).pack(side="left")
         self.v_call = tk.StringVar(value=self.s["call_id"])
         e = ttk.Entry(bar, textvariable=self.v_call, width=34)
@@ -192,6 +196,11 @@ class App:
         self.v_auto = tk.BooleanVar(value=bool(self.s.get("autoplay")))
         ttk.Checkbutton(row, text="Play last station at start", variable=self.v_auto).pack(side="right")
         self.v_auto.trace_add("write", lambda *a: self._changed())
+        self.v_reconnect = tk.BooleanVar(value=bool(self.s.get("reconnect", True)))
+        ttk.Checkbutton(row, text="Retry on hang up", variable=self.v_reconnect).pack(
+            side="right", padx=(0, 10))
+        self.v_reconnect.trace_add("write", lambda *a: self._changed())
+        self.client.reconnect = self.v_reconnect.get()
         return f
 
     def _tab_commands(self, nb):
@@ -394,6 +403,13 @@ class App:
     def stop(self):
         self.client.hangup()
 
+    def toggle_mute(self):
+        # quick pause: the call stays up, only the audio out goes silent
+        p = self.client.player
+        p.muted = not p.muted
+        self.b_mute.configure(text="Unmute" if p.muted else "Mute")
+        self.log("Muted" if p.muted else "Unmuted")
+
     def _tune_selected(self, why=""):
         sel = self.tree.selection()
         if sel:
@@ -428,6 +444,8 @@ class App:
                        "buffer_s": self._buf(), "device": "" if self.v_dev.get() == "default" else self.v_dev.get(),
                        "autoplay": self.v_auto.get() if hasattr(self, "v_auto") else bool(self.s.get("autoplay")),
                        "nick": self.v_nick.get().strip()[:32]})
+        if hasattr(self, "v_reconnect"):
+            self.s["reconnect"] = self.client.reconnect = self.v_reconnect.get()
         self.client.set_nick(self.s["nick"])
         try:
             with open(SETTINGS, "w", encoding="utf-8") as f:
@@ -480,8 +498,14 @@ class App:
                 st.name = snap["name"] or st.name
                 st.listeners, st.now_playing, st.heard = snap["listeners"], snap["track"], time.time()
                 st.on_air, st.slots = True, snap["slots"]
-            elif st and (snap["state"] == "ended" or snap["message"] == "station off air"):
+            gone = snap["state"] == "ended" or (snap["state"] == "failed" and
+                                                 snap["message"] in ("station off air", "station offline"))
+            if st and gone and self._marked_off != st.call_id:
+                # once per hang up: later status answers (station back on air) must not be undone
+                self._marked_off = st.call_id
                 self.dir.mark_off(st.call_id)
+            if not gone:
+                self._marked_off = None
             sel = self.tree.selection()
             self.tree.delete(*self.tree.get_children())
             for st in sorted(list(self.dir.stations.values()), key=lambda s: (not s.on_air, -s.heard)):
@@ -510,6 +534,7 @@ class App:
             while True:
                 # a station we subscribed to tells it is on air: shown for a while in the status bar and the log
                 cid, text = self.notices.get_nowait()
+                self.client.station_back(cid)
                 name = self.dir.name_of(cid) or cid
                 line = f"📻 {name}: {' '.join(text.split())}"
                 self.log(line)
@@ -554,12 +579,15 @@ class App:
         if active:
             c.create_rectangle(x0, 54, x0 + (x1 - x0) * frac, 60, outline="",
                                fill=AMBER if s["buffer_s"] < target / 2 else LCD)
-        c.create_text(x0, 74, text=f"VOL {self.client.player.volume_db:+.1f}", anchor="w", fill=col, font=LCD_FONT)
+        if self.client.player.muted:
+            c.create_text(x0, 74, text="MUTE", anchor="w", fill=AMBER, font=LCD_FONT)
+        else:
+            c.create_text(x0, 74, text=f"VOL {self.client.player.volume_db:+.1f}", anchor="w", fill=col, font=LCD_FONT)
 
         msg = s["message"] or ""
         lines = [
             f"CALL ID  {s['call_id'] or '-'}",
-            f"STATE    {state.upper()}  {msg[:30]}" + (f"   LISTEN {s['listeners']}" + (f"/{s['slots']}" if s['slots'] else "")
+            f"STATE    {state.upper()}  {msg[:30]}" + (f"   LISTENERS {s['listeners']}" + (f"/{s['slots']}" if s['slots'] else "")
                                              if s['listeners'] is not None else ""),
             f"TIME     {hms(s['time'])}   {s['kbps']:.1f} kbit/s   HOPS {s['hops'] if s['hops'] is not None else '-'}"
             f"   DROPS {s['underruns']}",
@@ -567,6 +595,7 @@ class App:
         ]
         for i, t in enumerate(lines):
             c.create_text(12, 44 + i * 18, text=t, anchor="w", fill=col, font=LCD_FONT, tags=("cid",) if i == 0 else ())
+        draw_progress(c, 12, w - 192, 117, s["progress"], active, s["live"], self.tick // 2)
         draw_vu(c, w, self.vu, active)
         if self.stamping:
             on = (self.tick // 5) % 2 == 0

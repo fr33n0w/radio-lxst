@@ -2,3 +2,4 @@ rns
 lxmf
 lxst
 numpy
+psutil
