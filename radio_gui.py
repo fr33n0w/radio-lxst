@@ -3,6 +3,7 @@
 
 import os
 import sys
+import faulthandler
 import json
 import time
 import queue
@@ -15,22 +16,15 @@ import radio_lxst as rl
 import bpm
 import radio_client as rc
 import station_lxmf as sl
-from ui_common import (LCD_BOLD, BG, EDGE, LCD_BG, DIM, LCD, LCD_DIM, AMBER, UI_FONT, TITLE_FONT, LCD_FONT, LCD_BIG, hms,
-                       apply_style, volume_scale, draw_vu, draw_badge, draw_progress, LogBox, copy_text, context_menu, hash_of, update_banner, about_tab, rns_watch, rns_lost)
+import station_ctl as ctl
+import station_stats as sstats
+from ui_common import (app_id, stop_children, set_icon, LCD_BOLD, BG, EDGE, LCD_BG, DIM, LCD, LCD_DIM, AMBER, UI_FONT, TITLE_FONT, LCD_FONT, LCD_BIG, hms,
+                       apply_style, volume_scale, draw_vu, draw_badge, draw_progress, LogBox, copy_text, context_menu, hash_of, update_banner, about_tab, rns_watch, usage_watch, rns_lost)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SETTINGS = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.path.join(HERE, "settings.json")
-DEFAULTS = {
-    "name": "radio-lxst", "mode": "url", "url": "", "folder": "", "shuffle": False, "input_device": "",
-    "frame_ms": 120, "announce_on_start": True, "announce_every_min": 60,
-    "identity": os.path.join(HERE, "storage", "identity"), "rnsconfig": "", "auto_start": False,
-    "gain_db": 0.0, "limiter_on": True, "limiter_ceiling_db": -2.0, "monitor_device": "",
-    "lxmf_on": True, "lxmf_every_h": 3, "slots": 0,
-    "fade_on": False, "fade_s": 3, "mix_on": False, "mix_s": 5, "trim_silence": False, "beat_on": False, "beat_n": 32,
-    "loop_out": False, "loop_in": False, "loop_n": 8, "loop_times": 4,
-    "confirm_play": False, "norm_on": False, "norm_lufs": -14,
-}
-BEAT_CHOICES = (8, 16, 32, 64, 128)  # beatmix length in beats
+DEFAULTS = ctl.DEFAULTS  # same settings.json keys as the headless station
+BEAT_CHOICES = ctl.BEAT_CHOICES  # beatmix length in beats
 # Playlist Sort menu: (label, key, reverse), None = separator
 PL_SORTS = (
     ("Title A-Z", "name", False), ("Title Z-A", "name", True), None,
@@ -74,11 +68,13 @@ class App:
         RNS.logdest = RNS.LOG_CALLBACK
         RNS.logcall = lambda line: self.logq.put(line)
         rl.set_frame_ms(int(self.s["frame_ms"]))
+        rl.set_phone_60(self.s["phone_60"])
         self.radio = rl.Radio(rl.load_identity(self.s["identity"]), self.s["name"],
                               storage=os.path.dirname(os.path.abspath(self.s["identity"])),
                               lxmf_on=bool(self.s["lxmf_on"]))
         self._apply_announce()
 
+        self.late_peak = 0.0
         self._build()
         root.protocol("WM_DELETE_WINDOW", self.quit)
         self.log(f"radio-lxst {rl.__version__} ready, identity {self.radio.identity_hash}")
@@ -156,8 +152,9 @@ class App:
         nb.add(self._tab_playlist(nb), text="Playlist")
         nb.add(self._tab_output(nb), text="Output")
         nb.add(self._tab_replies(nb), text="Replies")
+        nb.add(self._tab_stats(nb), text="Stats")
         nb.add(self._tab_log(nb), text="Log")
-        nb.add(about_tab(nb, "radio-lxst", rl.__version__), text="About")
+        nb.add(about_tab(nb, "radio-lxst", rl.__version__, "station"), text="About")
         nb.enable_traversal()
 
         # usage in its own label beside status: placed inside it, every status redraw hid it on Windows
@@ -167,8 +164,7 @@ class App:
         self.usage.pack(side="right")
         self.status = tk.Label(self.status_row, text="", bg=BG, fg=DIM, font=UI_FONT, anchor="w")
         self.status.pack(side="left", fill="x", expand=True)
-        self._procs = {}
-        self._usage_tick()
+        usage_watch(r.winfo_toplevel(), self.usage)
         # click on the CALL ID line of the display copies it
         self.lcd.tag_bind("cid", "<Button-1>", lambda ev: self.copy_id())
         self.lcd.tag_bind("mon", "<Button-1>", lambda ev: self.toggle_monitor())
@@ -187,27 +183,6 @@ class App:
         src = self.radio.source
         if src and getattr(src, "folder", None) and hasattr(src, "seek"):
             src.seek((ev.x - bx0) / max(1, bx1 - bx0) * dur)
-
-    def _usage_tick(self):
-        """CPU and RAM of the station and its children (ffmpeg, BPM analysis), every 2 s; needs psutil."""
-        try:
-            import psutil
-            me = self._procs.get("me") or self._procs.setdefault("me", psutil.Process())
-            cpu, ram, seen = 0.0, 0, {"me"}
-            for p in [me] + me.children(recursive=True):
-                q = self._procs.setdefault(p.pid, p)  # same object: cpu_percent counts since the last call
-                seen.add(p.pid)
-                try:
-                    cpu += q.cpu_percent(None)
-                    ram += q.memory_info().rss
-                except psutil.Error:
-                    pass
-            for k in set(self._procs) - seen:
-                del self._procs[k]
-            self.usage.configure(text=f"CPU {cpu / (psutil.cpu_count() or 1):.0f}%   RAM {ram / 2**20:.0f} MB")
-        except Exception:
-            return  # no psutil: nothing shown
-        self.root.after(2000, self._usage_tick)
 
     def _tab_listeners(self, nb):
         f = ttk.Frame(nb, padding=6)
@@ -317,6 +292,7 @@ class App:
         self.pl_drawn = None     # (playlist, version) on screen
         self.pl_air = None       # (path on air, paths mixing) as drawn
         self.pl_iid = {}         # tree row -> path
+        self.pl_rows = {}        # path -> tree row
         self._drag = None
         head = ttk.Frame(f)
         head.pack(fill="x", pady=(0, 4))
@@ -327,10 +303,11 @@ class App:
         self.pl_info.pack(side="left")
         box = ttk.Frame(f)
         box.pack(fill="both", expand=True)
-        self.pl_tree = ttk.Treeview(box, columns=("n", "track", "len", "bpm", "ok", "plays", "last"), show="headings",
-                                    height=8, selectmode="extended")
+        self.pl_tree = ttk.Treeview(box, columns=("n", "track", "len", "bpm", "gain", "ok", "plays", "last"),
+                                    show="headings", height=8, selectmode="extended")
         for c, text, w, anchor in (("n", "#", 50, "e"), ("ok", "Played", 50, "center"), ("plays", "Plays", 45, "e"),
                                    ("last", "Last played", 110, "w"), ("bpm", "BPM", 55, "e"),
+                                   ("gain", "Gain dB", 60, "e"),
                                    ("len", "Length", 60, "e")):
             self.pl_tree.heading(c, text=text)
             self.pl_tree.column(c, width=w, anchor=anchor, stretch=False)
@@ -346,7 +323,7 @@ class App:
             ttk.Button(arrows, text=text, width=3, command=lambda s=step: self._pl_move(s)).pack(fill="x", pady=(0, 4))
         # tracks from anywhere: they stay in their folders, only the list keeps them
         for text, cmd in (("+ Files", self._pl_add_files), ("+ Folder", self._pl_add_folder),
-                          ("Remove", self._pl_remove)):
+                          ("Remove", self._pl_remove), ("Clear", self._pl_clear)):
             ttk.Button(arrows, text=text, width=8, command=cmd).pack(fill="x", pady=(8 if text == "+ Files" else 0, 4))
         sb.pack(side="right", fill="y")
         self.pl_tree.pack(side="left", fill="both", expand=True)  # last: a narrow window squeezes the list, not the buttons
@@ -435,12 +412,26 @@ class App:
         if pl is None:
             if self.pl_drawn is not None:
                 t.delete(*t.get_children())
-                self.pl_drawn, self.pl_iid = None, {}
+                self.pl_drawn, self.pl_iid, self.pl_rows = None, {}, {}
             self.pl_info.configure(text="Choose a folder in Input to see its tracks here")
             return
         bv = self._bpm().version
+        d = self.pl_drawn
+        if d and d[0] is pl and d[1] == pl.version and d[2] != bv:
+            # only new BPM results: update those rows, no full redraw
+            done = self._bpm().done_since(d[2])
+            if done is not None:
+                rows = self.pl_rows
+                for p in done:
+                    iid = rows.get(p)
+                    if iid:
+                        n = "▶" if self.pl_air and p == self.pl_air[0] else int(iid[1:]) + 1
+                        t.item(iid, values=self._pl_row(pl, p, n))
+                self.pl_drawn = (pl, pl.version, bv)
+                self._pl_info(pl, src)
         if self.pl_drawn != (pl, pl.version, bv):
             keep = set(self._pl_paths())
+            top = t.yview()[0]  # a remove or a move must not scroll the list back to the track on air
             t.delete(*t.get_children())
             self.pl_iid = {}
             sel = []
@@ -452,13 +443,13 @@ class App:
                     sel.append(iid)
             if sel:
                 t.selection_set(sel)
+            self.pl_rows = {p: iid for iid, p in self.pl_iid.items()}
+            t.yview_moveto(top)
+            new_list = not d or d[0] is not pl or d[1] != pl.version
             self.pl_drawn, self.pl_air = (pl, pl.version, bv), None
-            if pl.scanned:
-                self._bpm().want(pl.items())
-            on = "on air" if src is not None and getattr(src, "playlist", None) is pl else "not on air"
-            n = f"{len(self.pl_iid)} tracks" if pl.scanned else "scanning..."
-            left = self._bpm().pending()
-            self.pl_info.configure(text=f"{n} in {pl.folder}  ({on})" + (f"   BPM: {left} to analyse" if left else ""))
+            if pl.scanned and new_list:
+                self._bpm().want(pl.items())  # stats every file: only when the list changed
+            self._pl_info(pl, src)
         mixed = set(src.mixing_paths()) if air and hasattr(src, "mixing_paths") else set()
         state = (air, frozenset(mixed))
         if state != self.pl_air:
@@ -468,9 +459,16 @@ class App:
                 if p in touch:
                     tag = ("mix",) if p in mixed else ("air",) if p == air else ()
                     t.item(iid, values=self._pl_row(pl, p, "▶" if p == air else i + 1), tags=tag)
-                    if p == air and p != old_air:
-                        t.see(iid)
+                    if p == air and p != getattr(self, "_pl_seen_air", None):
+                        t.see(iid)  # only when a new track goes on air
+            self._pl_seen_air = air
             self.pl_air = state
+
+    def _pl_info(self, pl, src):
+        on = "on air" if src is not None and getattr(src, "playlist", None) is pl else "not on air"
+        n = f"{len(self.pl_iid)} tracks" if pl.scanned else "scanning..."
+        left = self._bpm().pending()
+        self.pl_info.configure(text=f"{n} in {pl.folder}  ({on})" + (f"   BPM: {left} to analyse" if left else ""))
 
     def _pl_row(self, pl, path, n):
         now, last = pl.played(path)
@@ -479,7 +477,18 @@ class App:
             last = time.strftime(fmt, time.localtime(last))
         dur = (self._bpm().get(path) or {}).get("dur")
         length = (f"{int(dur // 60)}:{int(dur % 60):02d}" if dur < 3600 else hms(dur)) if dur else ""
-        return (n, pl.rel(path), length, self._pl_bpm(path), "✓" if now else "", pl.plays.get(path) or "", last or "")
+        return (n, pl.rel(path), length, self._pl_bpm(path), self._pl_gain(path), "✓" if now else "",
+                pl.plays.get(path) or "", last or "")
+
+    def _pl_gain(self, path):
+        """Normalize gain of the track, empty when Normalize is off."""
+        target = self.radio.norm_lufs
+        if target is None:
+            return ""
+        lufs = (self._bpm().get(path) or {}).get("lufs")
+        if lufs is None:
+            return "..." if self._bpm().waiting(path) else "?"
+        return f"{rl.norm_gain_db(target, lufs):+.1f}"
 
     def _pl_sort(self, key, reverse):
         pl = self._playlist()
@@ -569,6 +578,19 @@ class App:
         if pl and paths:
             pl.remove(paths)  # only from the list, the files stay on disk
             self.log(f"Playlist: removed {pl.rel(paths[0])}" + (f" (+{len(paths) - 1})" if len(paths) > 1 else ""))
+
+    def _pl_clear(self):
+        pl = self._playlist()
+        if pl and pl.items():
+            self._pl_ask_show("Clear the whole list? Files stay on disk, + Folder brings them back.",
+                              self._pl_clear_go, "Clear")
+
+    def _pl_clear_go(self):
+        self._pl_ask_hide()
+        pl = self._playlist()
+        if pl:
+            pl.clear()
+            self.log("Playlist: cleared")
 
     def _pl_move(self, delta):
         pl, paths = self._playlist(), self._pl_paths()
@@ -704,8 +726,9 @@ class App:
             e.configure(cursor="hand2")
             e.bind("<Button-1>", lambda ev, l=lbl, v=val: self.copied(l.split(" (")[0], v))
             e.grid(row=6 + i, column=2, sticky="w", pady=(14 if i == 0 else 2, 0))
-        ttk.Label(f, text="Quality changes apply after Stop and On air.", style="Dim.TLabel").grid(
-            row=9, column=1, columnspan=2, sticky="w", pady=(12, 0))
+        self.v_phone60 = tk.BooleanVar(value=bool(self.s["phone_60"]))
+        ttk.Checkbutton(f, text="Phones always get 60 ms packets (LXST standard)",
+                        variable=self.v_phone60).grid(row=9, column=1, columnspan=2, sticky="w", pady=(12, 0))
 
         ttk.Label(f, text="Monitor").grid(row=10, column=0, sticky="w", pady=(14, 0))
         self.v_mon_dev = tk.StringVar(value=self.s["monitor_device"] or "Default")
@@ -729,7 +752,7 @@ class App:
         sb.bind("<FocusOut>", lambda e: self.v_lxmf_every.set(str(self.radio.lxmf_every_h)))
         ttk.Label(row, text=f"hours (min {rl.LXMF_MIN_EVERY_H}); off = no LXMF address, one announce less").pack(
             side="left")
-        for v in (self.v_name, self.v_frame, self.v_ann_start, self.v_ann_every, self.v_lxmf, self.v_lxmf_every,
+        for v in (self.v_name, self.v_frame, self.v_phone60, self.v_ann_start, self.v_ann_every, self.v_lxmf, self.v_lxmf_every,
                   self.v_slots):
             v.trace_add("write", lambda *a: self._output_changed())
         return f
@@ -820,6 +843,47 @@ class App:
         self._rep_pick()
         self._rep_fill()
         self.log(f"Replies saved ({len(kept)} custom)")
+
+    def _tab_stats(self, nb):
+        f = ttk.Frame(nb, padding=6)
+        self.st_tree = ttk.Treeview(f, columns=("what", "run", "all"), show="headings", height=12)
+        for c, t, w, a in (("what", "", 190, "w"), ("run", "This run", 140, "e"), ("all", "All time", 190, "e")):
+            self.st_tree.heading(c, text=t)
+            self.st_tree.column(c, width=w, anchor=a, stretch=c == "what")
+        sb = ttk.Scrollbar(f, orient="vertical", command=self.st_tree.yview)
+        self.st_tree.configure(yscrollcommand=sb.set)
+        self.st_tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="left", fill="y")
+        right = ttk.Frame(f)
+        right.pack(side="left", fill="both", expand=True, padx=(8, 0))
+        self.st_top = ttk.Treeview(right, columns=("n", "name"), show="headings", height=12)
+        self.st_top.heading("n", text="Plays")
+        self.st_top.heading("name", text="Most played")
+        self.st_top.column("n", width=50, anchor="e", stretch=False)
+        self.st_top.column("name", width=220, anchor="w")
+        sb2 = ttk.Scrollbar(right, orient="vertical", command=self.st_top.yview)
+        self.st_top.configure(yscrollcommand=sb2.set)
+        sb2.pack(side="right", fill="y")
+        self.st_top.pack(side="left", fill="both", expand=True)
+        self.st_shown = {}      # row label -> values on screen
+        self.st_top_key = None  # tracks count when the top list was read
+        return f
+
+    def _stats_refresh(self):
+        v = self.radio.stats.view()
+        for i, vals in enumerate(sstats.rows(v["run"], v["all"])):
+            iid = f"r{i}"
+            if self.st_shown.get(iid) != vals:  # only the rows that changed
+                if iid in self.st_shown:
+                    self.st_tree.item(iid, values=vals)
+                else:
+                    self.st_tree.insert("", "end", iid=iid, values=vals)
+                self.st_shown[iid] = vals
+        if self.st_top_key != v["all"]["tracks"]:
+            self.st_top_key = v["all"]["tracks"]
+            self.st_top.delete(*self.st_top.get_children())
+            for n, _, name in sstats.top_tracks(self.radio.storage):
+                self.st_top.insert("", "end", values=(n, name))
 
     def _tab_log(self, nb):
         f = ttk.Frame(nb, padding=4)
@@ -969,7 +1033,7 @@ class App:
             if src.device[len("Loopback: "):] == (dev or rl.default_output_name()):
                 self.log("Monitor not started: it would play into the same device the input records (feedback)")
                 return
-        mon = rc.Player(prefill=0.3, device=dev or None, max_extra=0.5)
+        mon = rc.monitor_player(dev or None)
         mon.start()
         self.radio.monitor = mon
         self.log(f"Monitor on: {dev or 'default output'}")
@@ -1009,12 +1073,21 @@ class App:
             self.radio.limiter.ceiling_db = max(-12.0, min(0.0, float(self.v_ceil.get())))
         except ValueError:
             pass
-        self.radio.norm_lufs = int(self.v_norm_lufs.get()) if self.v_norm.get() else None
+        norm = int(self.v_norm_lufs.get()) if self.v_norm.get() else None
+        if norm != self.radio.norm_lufs:
+            self.radio.norm_lufs = norm
+            self.pl_drawn = None  # Gain column follows the new target
         self.save()
 
     def _output_changed(self):
         self.save()
         self._apply_announce()
+        if self.v_phone60.get() != rl.PHONE_60:
+            rl.set_phone_60(self.v_phone60.get())
+            self.log(f"Phones get {'60 ms packets always' if rl.PHONE_60 else 'the station quality'}")
+        if int(self.v_frame.get()) != rl.PACKET_MS:
+            rl.set_frame_ms(int(self.v_frame.get()))  # live: our clients get the new packets from the next one
+            self.log(f"Quality: {'Steady' if rl.PACKET_MS >= 120 else 'High'}, {rl.PACKET_MS} ms packets")
         if not self.radio.on_air:
             self.radio.name = self.s["name"]
 
@@ -1056,7 +1129,7 @@ class App:
                 "name": self.v_name.get(), "mode": self.v_mode.get(), "url": self.v_url.get(),
                 "folder": self.v_folder.get(), "shuffle": self.v_shuffle.get(),
                 "input_device": self.v_input.get(), "monitor_device": self._monitor_device(),
-                "frame_ms": int(self.v_frame.get()), "announce_on_start": self.v_ann_start.get(),
+                "frame_ms": int(self.v_frame.get()), "phone_60": self.v_phone60.get(), "announce_on_start": self.v_ann_start.get(),
                 "announce_every_min": every, "auto_start": self.v_auto.get(),
                 "gain_db": self.radio.gain_db, "limiter_on": self.radio.limiter_on,
                 "limiter_ceiling_db": self.radio.limiter.ceiling_db,
@@ -1077,6 +1150,10 @@ class App:
     def quit(self):
         self.save()
         try:
+            self.radio.stats.save()
+        except Exception:
+            pass
+        try:
             if self.radio.monitor:
                 self.radio.monitor.stop()
             self.radio.stop() if self.radio.on_air else None
@@ -1084,6 +1161,7 @@ class App:
             pass
         time.sleep(0.3)  # let audio threads leave WASAPI before exit
         self.root.destroy()
+        stop_children()
         os._exit(0)
 
     # refresh
@@ -1112,9 +1190,11 @@ class App:
             na = snap["next_announce"]
             self.ann_info.configure(text=f"next announce in {hms(max(0, na))}" if na is not None else "")
             if time.time() > self.flash[1]:
-                self.status.configure(text=f"Reticulum {'LOST' if rns_lost() else 'ok'}   frames {rl.FRAME_MS} ms   "
+                self.status.configure(text=f"Reticulum {'LOST' if rns_lost() else 'ok'}   packets {rl.PACKET_MS} ms   "
                                            f"buffer {snap['buffer_ms'] / 1000:.1f} s   "
-                                           f"send late {snap['late_ms']:.0f} ms", fg=DIM)
+                                           f"send late {snap['late_ms']:.0f} ms (max {self.late_peak:.0f})   "
+                                           f"missing frames {self.radio.underruns}", fg=DIM)
+            self.late_peak = max(self.late_peak, snap["late_ms"])  # kept: a glitch heard can be matched later
             self.radio.max_late = 0.0
             on = snap["on_air"]
             self.b_stop.state(["!disabled"] if on or snap["waiting"] else ["disabled"])
@@ -1125,6 +1205,8 @@ class App:
             self.b_ann.configure(text=f"Announce in {hms(aw)}" if aw else "Announce now")
             self.b_ann.state(["disabled"] if aw else ["!disabled"])
             self._pl_refresh()
+            if self.tick % 16 == 0:
+                self._stats_refresh()
 
         try:
             while True:
@@ -1150,15 +1232,18 @@ class App:
         else:
             draw_badge(c, w, "ON AIR" if on else "OFF AIR", on, blink)
 
-        c.create_text(w - 180, 44, text=f"VOL {snap['gain_db']:+.1f}", anchor="w",
+        c.create_text(w - 180, 42, text=f"VOL {snap['gain_db']:+.1f}", anchor="w",
                       fill=LCD if on else LCD_DIM, font=LCD_FONT)
         if snap["limiter_on"]:
             gr = snap["reduction_db"]
             col = AMBER if gr >= 0.5 else (LCD if on else LCD_DIM)
-            c.create_text(w - 180, 62, text=f"LIM -{gr:.1f}" if gr >= 0.05 else "LIM  ok",
+            c.create_text(w - 180, 57, text=f"LIM -{gr:.1f}" if gr >= 0.05 else "LIM  ok",
                           anchor="w", fill=col, font=LCD_FONT)
         else:
-            c.create_text(w - 180, 62, text="LIM  off", anchor="w", fill=LCD_DIM, font=LCD_FONT)
+            c.create_text(w - 180, 57, text="LIM  off", anchor="w", fill=LCD_DIM, font=LCD_FONT)
+        od = snap.get("out_db")
+        c.create_text(w - 180, 72, text=f"OUT {od:5.1f}" if od is not None else "OUT   --", anchor="w",
+                      fill=LCD if on else LCD_DIM, font=LCD_FONT)
 
         lines = [
             f"CALL ID   {self.radio.identity_hash}",
@@ -1185,6 +1270,7 @@ class App:
 
 
 def main():
+    app_id("station")  # before any window, also the "already running" box
     storage = os.path.dirname(os.path.abspath(load_settings()["identity"]))
     lock = rl.lock_station(storage)
     if lock is None:
@@ -1195,7 +1281,15 @@ def main():
         messagebox.showinfo("radio-lxst station", rl.already_on(storage))
         r.destroy()
         sys.exit(1)
+    try:  # native crashes leave a trace even under pythonw
+        path = os.path.join(storage, "station_crash.log")
+        big = os.path.isfile(path) and os.path.getsize(path) > 1_000_000
+        main.crash = open(path, "w" if big else "a", encoding="utf-8")
+        faulthandler.enable(file=main.crash, all_threads=True)
+    except OSError:
+        pass
     root = tk.Tk()
+    set_icon(root, "station")
     try:
         App(root)
     except Exception as e:

@@ -9,6 +9,7 @@ from collections import deque
 
 import RNS
 import LXMF
+from station_stats import lxmf_text
 
 RATE_MAX = 20            # replies per sender in RATE_WINDOW
 RATE_WINDOW = 60
@@ -53,8 +54,8 @@ DEFAULT_REPLIES = {
              "Source: {source}\n"
              "Quality: Opus up to {kbps} kbit/s\n"
              "Subscribers: {subscribers}"),
-    "status_on": "{name} is on air for {uptime}\nListeners: {listeners}\nNow playing: {now_playing}",
-    "status_off": "{name} is off air.",
+    "status_on": "{name} is on air for {uptime}\nListeners: {listeners}\nNow playing: {now_playing}\n\n{stats}",
+    "status_off": "{name} is off air.\n\n{stats}",
     "link": ("Call ID: {call_id}\n"
              "Dial it in Sideband or rnphone (Voice, profile SHQ), or in the radio-lxst client.\n"
              "LXST destination: {lxst}\n"
@@ -77,7 +78,7 @@ REPLY_LABELS = (
 )
 CUSTOM = {k for k, _ in REPLY_LABELS}  # link is not: its addresses and repo stay as they are
 PLACEHOLDERS = ("name", "version", "source", "kbps", "subscribers", "listeners", "slots", "uptime",
-                "now_playing", "call_id", "lxst", "lxmf", "station", "repo")
+                "now_playing", "call_id", "lxst", "lxmf", "station", "repo", "stats")
 REPLY_MAX = 2000
 
 
@@ -223,6 +224,7 @@ class StationLXMF:
                 RNS.log(f"LXMF from {src.hex()}: over {RATE_MAX} messages/min, not answered", RNS.LOG_NOTICE)
                 return
             hits.append(now)
+        self.radio.stats.inc("lxmf_msgs")
         cmd = text.split()[0].lower().strip("/!.") if text else ""
         self.send(src, self._answer(cmd, src, name), cmd if cmd in self.COMMANDS else "hello")
 
@@ -245,6 +247,7 @@ class StationLXMF:
             RNS.log(f"Subscribed {who(src, name)}" if new else f"Already subscribed: {who(src, name)}"
                     , RNS.LOG_NOTICE)
             if new:
+                self.radio.stats.inc("subscribed")
                 RNS.log(f"Subscribers: {n}", RNS.LOG_NOTICE)
             return self.reply("subscribed" if new else "already_subscribed")
         if cmd == "unsubscribe":
@@ -254,6 +257,7 @@ class StationLXMF:
                     self._save()
                 n = len(self.subs)
             if was:
+                self.radio.stats.inc("unsubscribed")
                 RNS.log(f"Unsubscribed {who(src, name)}, subscribers: {n}", RNS.LOG_NOTICE)
             return self.reply("unsubscribed" if was else "not_subscribed")
         return self.reply("hello")
@@ -269,6 +273,7 @@ class StationLXMF:
             "uptime": RNS.prettytime(time.time() - r.on_air_since) if r.on_air and r.on_air_since else "-",
             "now_playing": r.now_playing_text(), "call_id": r.identity_hash, "lxst": r.dest.hash.hex(),
             "lxmf": self.dest.hash.hex(), "station": st.hex(), "repo": REPO_URL,
+            "stats": lxmf_text(r.stats.view()),
         }
 
     def reply(self, key, values=None):

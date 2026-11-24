@@ -21,7 +21,7 @@ except Exception:
 
 from LXST.Codecs import Opus
 
-__version__ = "0.6"
+__version__ = "0.7"
 
 STATION_ASPECT = "radiolxst.station"
 FIELD_SIGNALLING = 0x00
@@ -37,6 +37,13 @@ CHANNELS = 2
 
 PROFILES = {"SHQ": 0x60, "HQ": 0x50, "MQ": 0x40, "LBW": 0x30, "VLBW": 0x20, "ULBW": 0x10}
 
+CARD_BUFFER_S = 0.5             # sound card buffer: covers the 150-200 ms the audio thread waits for the GIL during a stamp
+CARD_KEEP_S = 30                # card left open (silent) this long after Stop
+CARD_DRY_S = 0.015              # card silent longer than this = a gap heard (counted as CARD)
+STALL_LOG_S = 0.08              # client process frozen longer than this: logged with the time
+DRIFT_RATE = 0.002              # frames played this much shorter/longer to follow the card clock (inaudible)
+DRIFT_MARGIN_S = 0.5            # starts when the buffer is this far from the chosen size
+DRIFT_STOP_S = 0.1              # stops when back this close
 PATH_WAIT = 20                  # seconds for a path answer
 ANSWER_WAIT = 30                # seconds for the station to answer
 DIAL_TRIES = 2                  # second try drops the path first: the first one can be stale
@@ -45,9 +52,10 @@ HANGUP_WAITS = (15, 30, 60)     # same after the station hung up, if reconnect i
 NO_AUDIO_S = 20                 # playing but no audio this long = lost (RNS notices a dead link much later)
 STEADY_S = 60                   # this much good listening resets the retry count
 STATUS_EVERY = 180              # seconds between status requests to one station
+STATUS_BACKOFF_MAX = 20         # no reply: the wait doubles up to this many times STATUS_EVERY (path requests flood)
 STATUS_MIN_GAP = 15             # Refresh button: not more often than this per station
 STATUS_WINDOW = 24 * 3600       # only stations heard (announce or answer) in the last day are asked
-STATUS_PARALLEL = 3             # status requests at once
+STATUS_PARALLEL = 1             # status requests at once: parallel path/link stamps paused the audio 80-150 ms
 STATUS_TIMEOUT = 25             # path + link + answer
 NO_ANSWER = "no answer"
 
@@ -70,15 +78,95 @@ class _Sink:
     samplerate = SAMPLE_RATE
 
 
+_com_patched = False
+
+
+def _com_patch(soundcard):
+    """LXST sets COM up on a thread after a WMI query (platform.win32_ver, COM itself on Python 3.12) and shuts it
+    down at every player close: both crashed the process now and then. The version comes without COM, COM stays up."""
+    global _com_patched
+    if _com_patched:
+        return
+    _com_patched = True
+    import types
+    ver = (str(sys.getwindowsversion().major), "", "", "")
+    soundcard.platform = types.SimpleNamespace(win32_ver=lambda: ver)
+    soundcard._com.release_com = lambda: None
+    soundcard._Player.play = _safe_play
+
+
+def _safe_play(self, data):
+    """LXST's play() releases all the free card space even when the data is shorter: the rest is played as
+    garbage (a click per frame not a multiple of the card period, a long gap after any pause). Write only our data."""
+    import numpy
+    data = numpy.ascontiguousarray(data, dtype="float32")
+    if data.ndim == 1:
+        data = data[:, None]
+    nch = len(set(self.channelmap))
+    if data.shape[1] == 1 and nch != 1:
+        data = numpy.tile(data, [1, nch])
+    data = data[:, sorted(range(len(self.channelmap)), key=lambda k: self.channelmap[k])]
+    if data.shape[1] != nch:
+        raise TypeError(f"second dimension of data must be equal to the number of channels, not {data.shape[1]}")
+    from LXST.Platforms.windows.soundcard import _ffi
+    room = min(2400, max(1, self.buffersize // 2))
+    while len(data):
+        # wait for room for 50 ms (or the rest): every card call gives up the GIL, few calls = few waits for it
+        free = self._render_available_frames()
+        if free < min(len(data), room):
+            time.sleep(0.005)
+            continue
+        towrite = min(free, len(data))
+        raw = numpy.ascontiguousarray(data[:towrite]).tobytes()
+        buffer = self._render_buffer(towrite)
+        _ffi.memmove(buffer[0], raw, len(raw))
+        self._render_release(towrite)
+        data = data[towrite:]
+
+
 def _com_init():
     # LXST's Windows backend only sets up COM in the thread that imports it first
     if sys.platform == "win32":
         from LXST.Platforms.windows import soundcard
+        _com_patch(soundcard)
         soundcard._com.init_com()
 
 
-# LXST's Windows soundcard crashes if two threads enumerate or open devices at once
-AUDIO_LOCK = threading.RLock()
+class _AudioLock:
+    """LXST's Windows soundcard crashes if two threads enumerate or open devices at once, also station and client
+    opening the same card from two processes: a thread lock plus a Windows mutex shared by our processes."""
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._owned = []  # per nested enter, only touched with _lock held
+        self._mutex = None
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                self._k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                self._k32.CreateMutexW.restype = ctypes.c_void_p
+                self._k32.WaitForSingleObject.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+                self._k32.ReleaseMutex.argtypes = (ctypes.c_void_p,)
+                self._mutex = self._k32.CreateMutexW(None, False, "Local\\radio-lxst-audio")
+            except Exception:
+                self._mutex = None
+
+    def __enter__(self):
+        self._lock.acquire()
+        owned = False
+        if self._mutex:
+            # 0 = ours, 0x80 = left by a process that died with it: ours too; on timeout go on unlocked
+            owned = self._k32.WaitForSingleObject(self._mutex, 5000) in (0, 0x80)
+        self._owned.append(owned)
+        return self
+
+    def __exit__(self, *exc):
+        if self._owned.pop():
+            self._k32.ReleaseMutex(self._mutex)
+        self._lock.release()
+
+
+AUDIO_LOCK = _AudioLock()
 
 
 class locked_audio:
@@ -89,6 +177,7 @@ class locked_audio:
 
     def __enter__(self):
         with AUDIO_LOCK:
+            _com_init()
             self.cm = self.make()
             return self.cm.__enter__()
 
@@ -146,6 +235,66 @@ def fit_channels(f, ch):
     return out
 
 
+_players = [None]  # [watch started] + Players, for the stall watch
+
+
+def stall_watch():
+    """Logs when the whole process froze (GIL held, PC busy), with the time to match a click heard. Longer than
+    the card buffer while playing = the card ran dry: counted as CARD (the card's own padding is not exact enough)."""
+    if _players[0]:
+        return
+    _players[0] = True
+
+    def run():
+        while True:
+            t = time.perf_counter()
+            time.sleep(0.01)
+            late = time.perf_counter() - t - 0.01
+            if late > STALL_LOG_S:
+                heard = [p for p in _players[1:] if p.state == "playing" and late - p.card_s > CARD_DRY_S]
+                dry = late - min((p.card_s for p in heard), default=CARD_BUFFER_S)
+                for p in heard:
+                    p.card_gaps += 1
+                RNS.log(f"Client paused {late * 1000:.0f} ms" + (f", sound card silent ~{dry * 1000:.0f} ms"
+                                                                 if heard else ""), RNS.LOG_WARNING)
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+class _Resampler:
+    """Windowed-sinc resampler that keeps its phase across frames (per-frame linear interpolation wobbled the treble)."""
+    HALF = 12
+    PHASES = 512
+    _table = None
+
+    def __init__(self, channels):
+        self.channels = channels
+        self.buf = np.zeros((self.HALF, channels), dtype=np.float32)
+        self.pos = float(self.HALF)  # input index of the next output sample
+        self.taps = np.arange(-self.HALF + 1, self.HALF + 1)
+        if _Resampler._table is None:
+            d = (np.arange(self.PHASES + 1) / self.PHASES)[:, None] - self.taps[None, :]
+            w = np.sinc(d) * (0.42 + 0.5 * np.cos(np.pi * d / self.HALF) + 0.08 * np.cos(2 * np.pi * d / self.HALF))
+            _Resampler._table = (w / w.sum(axis=1, keepdims=True)).astype(np.float32)
+
+    def run(self, f, step):
+        self.buf = np.concatenate([self.buf, f.astype(np.float32)])
+        last = len(self.buf) - self.HALF  # an output sample needs HALF input samples after it
+        k = max(0, int(np.ceil((last - self.pos) / step)))
+        p = self.pos + step * np.arange(k)
+        p = p[p < last]
+        base = np.floor(p).astype(int)
+        w = self._table[np.rint((p - base) * self.PHASES).astype(int)]
+        idx = base[:, None] + self.taps[None, :]
+        out = np.stack([(w * self.buf[:, c][idx]).sum(axis=1) for c in range(self.channels)], axis=1)
+        self.pos = (p[-1] + step) if len(p) else self.pos
+        drop = int(np.floor(self.pos)) - self.HALF
+        if drop > 0:
+            self.buf = self.buf[drop:]
+            self.pos -= drop
+        return out
+
+
 class Player:
     """Jitter buffer + sound card output. Starts after `prefill` seconds of audio, rebuffers on underrun."""
 
@@ -160,31 +309,64 @@ class Player:
         self.lock = threading.Lock()
         self.state = "idle"
         self.underruns = 0
+        self.card_gaps = 0  # sound card ran dry while our buffer had audio (CPU busy): heard, not a network drop
+        self.overflows = 0  # frames thrown away because the buffer was full
+        self.drift_s = 0.0  # s taken out (+) or added (-) to follow the card's clock
+        self._step = 1.0
+        self._rs = None
         self.levels = (0.0, 0.0)
+        self.card_s = CARD_BUFFER_S
+        self.out_power = 0.0  # what reaches the card, 3 s average (L+R power, like the station's OUT)
         self.running = False
         self._run_id = 0
         self._wake = threading.Event()
         self._thread = None
 
     @property
+    def out_db(self):
+        return -0.691 + 10 * np.log10(self.out_power) if self.state == "playing" and self.out_power > 1e-9 else None
+
+    @property
     def buffer_s(self):
         return self.buffered / SAMPLE_RATE
 
     def push(self, frame):
+        # resampled here, not in the audio thread: its many numpy calls each wait for the GIL while a stamp runs
+        frame = self._follow_clock(frame)
         with self.lock:
             self.frames.append(frame)
             self.buffered += len(frame)
             limit = (self.prefill + self.max_extra) * SAMPLE_RATE
             while self.buffered > limit and len(self.frames) > 1:
                 self.buffered -= len(self.frames.popleft())
+                self.overflows += 1  # audio thrown away: heard as a jump
+
+    def _follow_clock(self, f):
+        """The card's clock is never the station's: the buffer creeps up (or down) for hours. While it is off the
+        chosen size, play DRIFT_RATE faster (slower) through a continuous sinc resampler: no jump, treble intact."""
+        off = self.buffer_s - self.prefill if self.state == "playing" else 0.0
+        if abs(off) > DRIFT_MARGIN_S:
+            self._step = 1 + DRIFT_RATE if off > 0 else 1 - DRIFT_RATE
+        elif abs(off) < DRIFT_STOP_S:
+            self._step = 1.0
+        if self._rs is None or self._rs.channels != f.shape[1]:
+            if self._step == 1.0:
+                return f
+            self._rs = _Resampler(f.shape[1])
+        out = self._rs.run(f, self._step)
+        self.drift_s += (len(f) - len(out)) / SAMPLE_RATE
+        return out.astype(f.dtype)
 
     def start(self):
         if self.running:
             return
         self.state = "buffering"
+        self._step, self._rs = 1.0, None
         self._run_id += 1
         self.running = True
         if self._thread is None:
+            stall_watch()
+            _players.append(self)
             self._thread = threading.Thread(target=self._worker, daemon=True)
             self._thread.start()
         self._wake.set()
@@ -196,7 +378,7 @@ class Player:
             self._wake.wait()
             self._wake.clear()
             if self.running:
-                self._run(self._run_id)
+                self._run()
 
     def stop(self):
         self.running = False
@@ -214,38 +396,79 @@ class Player:
             self.buffered -= len(f)
             return f
 
-    def _run(self, run_id):
+    @staticmethod
+    def _card_empty(player):
+        try:
+            return player.currentpadding == 0  # Windows only: samples still queued in the card
+        except Exception:
+            return False
+
+    def _run(self):
+        device = self.device
         try:
             from LXST.Sinks import Backend
             with AUDIO_LOCK:
-                backend = Backend(preferred_device=self.device)
+                backend = Backend(preferred_device=device)
         except Exception as e:
             RNS.log(f"No audio output: {e}", RNS.LOG_ERROR)
             self.state = "no audio output"
             return
+        # sound card buffer: at 20 ms a busy PC let it run dry (clicks with a full jitter buffer)
+        with locked_audio(lambda: backend.get_player(samples_per_frame=int(SAMPLE_RATE * self.card_s))) as player:
+            while True:
+                self._play(player, self._run_id)
+                # the card stays open a while: closing and opening it again soon after crashed LXST on Windows
+                idle = time.monotonic()
+                while not self.running and time.monotonic() - idle < CARD_KEEP_S:
+                    self._wake.wait(0.5)
+                if not self.running or self.device != device:
+                    break
+                self._wake.clear()
+        if self.running:
+            self._wake.set()  # another device: the worker opens it
+
+    def _play(self, player, run_id):
         target = self.prefill
-        with locked_audio(lambda: backend.get_player(samples_per_frame=SAMPLE_RATE // 50)) as player:
-            while self.running and run_id == self._run_id:
-                if self.state == "buffering":
-                    if self.buffer_s >= target:
-                        self.state = "playing"
-                    else:
-                        time.sleep(0.05)
-                        continue
-                f = self._pop()
-                if f is None:
-                    self.underruns += 1
-                    self.state = "buffering"
-                    self.levels = (0.0, 0.0)
-                    target = max(0.5, self.prefill / 2)  # refill faster after a dropout
+        fed = False
+        while self.running and run_id == self._run_id:
+            if self.state == "buffering":
+                if self.buffer_s >= target:
+                    self.state = "playing"
+                else:
+                    time.sleep(0.05)
                     continue
-                if self.muted:
-                    f = np.zeros_like(f)  # still paced and consumed: unmute is live, no delay
-                elif self.volume_db:
-                    f = np.clip(f * 10 ** (self.volume_db / 20), -1.0, 1.0)
-                peak = np.abs(f).max(axis=0)
-                self.levels = (float(peak[0]), float(peak[-1]))
-                player.play(fit_channels(f, getattr(player, "channels", CHANNELS)).astype(np.float32))
+            f = self._pop()
+            if f is None:
+                self.underruns += 1
+                self.state = "buffering"
+                self.levels = (0.0, 0.0)
+                target = max(0.5, self.prefill / 2)  # refill faster after a dropout
+                fed = False  # the card empties while we refill: not a card gap
+                continue
+            if self.muted:
+                f = np.zeros_like(f)  # still paced and consumed: unmute is live, no delay
+            elif self.volume_db:
+                f = np.clip(f * 10 ** (self.volume_db / 20), -1.0, 1.0)
+            peak = np.abs(f).max(axis=0)
+            self.levels = (float(peak[0]), float(peak[-1]))
+            self.out_power += (float(np.mean(f * f)) * 2 - self.out_power) * min(1.0, len(f) / SAMPLE_RATE / 3)
+            if fed and self._card_empty(player):
+                self.card_gaps += 1
+            player.play(fit_channels(f, getattr(player, "channels", CHANNELS)).astype(np.float32))
+            fed = True
+
+
+_monitor = None
+
+
+def monitor_player(device=None):
+    """The station's monitor, one Player reused: a new one per toggle opened the card while the old one closed it."""
+    global _monitor
+    if _monitor is None:
+        _monitor = Player(prefill=0.3, device=device, max_extra=0.5)
+        _monitor.card_s = 0.2  # the station's monitor: low delay
+    _monitor.device = device
+    return _monitor
 
 
 def announce_emitted(destination_hash):
@@ -265,6 +488,9 @@ class Station:
         self.emitted = 0  # when the station sent its last announce (its own clock)
         self.legacy = False  # before 0.4 the state came in the announce, newer stations answer a status request
         self.checked = 0  # last status request (answered or not)
+        self.fails = 0  # status requests in a row without a reply
+        self.version = ""  # radio-lxst version the station sent (announce or status)
+        self.fav = False  # starred by the user: listed first
         self.heard = time.time()
 
     @property
@@ -274,6 +500,13 @@ class Station:
         return f"{self.listeners}/{self.slots}" if self.slots else str(self.listeners)
 
     @property
+    def quality(self):
+        # what the station streams: High 60 ms packets (56 kbit/s max), Steady 120 ms (28)
+        if not self.kbps:
+            return ""
+        return "High" if self.kbps >= 56 else "Steady"
+
+    @property
     def hops(self):
         dh = RNS.Destination.hash_from_name_and_identity("lxst.telephony", bytes.fromhex(self.call_id))
         return RNS.Transport.hops_to(dh) if RNS.Transport.has_path(dh) else None
@@ -281,7 +514,8 @@ class Station:
     def to_dict(self):
         return {"call_id": self.call_id, "name": self.name, "listeners": self.listeners,
                 "now_playing": self.now_playing, "kbps": self.kbps, "on_air": self.on_air, "heard": self.heard,
-                "slots": self.slots, "emitted": self.emitted, "legacy": self.legacy, "checked": self.checked}
+                "slots": self.slots, "emitted": self.emitted, "legacy": self.legacy, "checked": self.checked,
+                "version": self.version, "fav": self.fav}
 
 
 class Directory:
@@ -306,6 +540,8 @@ class Directory:
                     s.emitted = d.get("emitted", 0) or 0
                     s.legacy = bool(d.get("legacy", False))
                     s.checked = d.get("checked", 0) or 0
+                    s.version = str(d.get("version") or "")
+                    s.fav = bool(d.get("fav", False))
                     self.stations[s.call_id] = s
         except Exception:
             pass
@@ -334,15 +570,17 @@ class Directory:
                 s = Station(cid, str(info.get("n", ""))[:48], info.get("l"), str(info.get("np", ""))[:64],
                             info.get("kb"), bool(info.get("air", True)))
                 s.slots = info.get("s") or 0
+                s.fav = bool(old and old.fav)
                 s.legacy = True
                 RNS.log(f"Heard station {s.name or cid} ({'on air' if s.on_air else 'off air'})", RNS.LOG_NOTICE)
             else:
                 # the announce only says the station exists: its state is asked (status request)
                 s = old or Station(cid, on_air=False)
                 s.name, s.kbps, s.legacy, s.heard = str(info.get("n", ""))[:48], info.get("kb"), False, time.time()
-                s.checked = 0  # ask now
+                s.checked, s.fails = 0, 0  # ask now
                 RNS.log(f"Heard station {s.name or cid}", RNS.LOG_NOTICE)
             s.emitted = emitted
+            s.version = str(info.get("v") or s.version)[:16]
             self.stations[cid] = s
             self.save()
             if callable(self.on_change):
@@ -368,8 +606,9 @@ class Directory:
             for s in sorted(list(self.stations.values()), key=lambda s: s.checked):
                 if len(self._busy) >= STATUS_PARALLEL:
                     break
+                wait = STATUS_EVERY * min(2 ** s.fails, STATUS_BACKOFF_MAX)
                 if s.legacy or s.call_id in skip or s.call_id in self._busy or now - s.heard > STATUS_WINDOW \
-                        or now - s.checked < STATUS_EVERY:
+                        or now - s.checked < wait:
                     continue
                 self._busy.add(s.call_id)
                 s.checked = now
@@ -379,7 +618,7 @@ class Directory:
         """Refresh button: ask again now (not more than once every STATUS_MIN_GAP s per station)."""
         for s in list(self.stations.values()):
             if not s.legacy and time.time() - s.checked >= STATUS_MIN_GAP:
-                s.checked = 0
+                s.checked, s.fails = 0, 0
         self.poll(skip)
 
     def _check(self, s):
@@ -393,18 +632,36 @@ class Directory:
                 if s.on_air or s.listeners or s.now_playing != "no reply":
                     RNS.log(f"Station {s.name or s.call_id}: no reply to status", RNS.LOG_INFO)
                 s.on_air, s.listeners, s.now_playing = False, None, "no reply"
+                s.fails += 1
             else:
                 s.on_air, s.listeners = bool(st.get("air")), st.get("l")
                 s.now_playing = str(st.get("np") or "")[:64] if s.on_air else "off air"
                 s.slots = st.get("s") or 0
+                s.kbps = st.get("kb", s.kbps)
                 s.name = str(st.get("n") or s.name)[:48]
-                s.heard = time.time()
+                s.heard, s.fails = time.time(), 0
+                s.version = str(st.get("v") or s.version)[:16]
             self.save()
             if callable(self.on_change):
                 self.on_change()
         finally:
             with self._busy_lock:
                 self._busy.discard(s.call_id)
+
+    def add(self, call_id):
+        """A Call ID typed in (seen on a map, announce never heard here): listed now, name and state asked at once.
+        Returns False if it is not a Call ID, None if already listed."""
+        cid = call_id.strip().lower()
+        if len(cid) != 32 or any(ch not in "0123456789abcdef" for ch in cid):
+            return False
+        if cid in self.stations:
+            return None
+        s = self.stations[cid] = Station(cid, on_air=False)
+        s.now_playing, s.checked = "asking...", 0
+        self.save()
+        if callable(self.on_change):
+            self.on_change()
+        return True
 
     def mark_off(self, call_id):
         """The station hung up or refused us: show it off air until it announces again."""
@@ -595,6 +852,19 @@ class Client:
 
     def _signal(self, link, signals):
         RNS.Packet(link, mp.packb({FIELD_SIGNALLING: signals}), create_receipt=False).send()
+
+    def set_profile(self, profile):
+        """New quality: kept for the next tune, and asked on the open call (the station switches codec)."""
+        if profile == self.profile:
+            return
+        self.profile = profile
+        link = self.link
+        if self.state == "playing" and link is not None and link.status == RNS.Link.ACTIVE:
+            try:
+                self._signal(link, [PREFERRED_PROFILE + profile])
+                RNS.log(f"Quality {profile:#04x} asked to the station", RNS.LOG_NOTICE)
+            except Exception as e:
+                RNS.log(f"Quality change failed: {e}", RNS.LOG_WARNING)
 
     def _packet(self, link, data, gen):
         if gen != self._gen:
@@ -800,9 +1070,10 @@ class Client:
         return {
             "state": self.state, "message": self.message, "call_id": cid,
             "name": name, "listeners": meta.get("l"), "slots": meta.get("s") or 0, "track": track, "progress": prog,
-            "live": self.live_text(shown),
+            "live": self.live_text(shown), "v": str(meta.get("v") or "")[:16],
+            "q": str(meta.get("q") or "")[:24], "ms": meta.get("ms"), "kb": meta.get("kb"),  # what this client gets (0.7 stations)
             "time": el, "kbps": self.bytes * 8 / el / 1000 if el > 1 else 0,
-            "buffer_s": p.buffer_s, "player": p.state, "underruns": p.underruns, "levels": p.levels,
+            "buffer_s": p.buffer_s, "player": p.state, "underruns": p.underruns, "card_gaps": p.card_gaps, "overflows": p.overflows, "levels": p.levels,
             "hops": (RNS.Transport.hops_to(self.link.destination.hash)
                      if self.link and RNS.Transport.has_path(self.link.destination.hash) else None),
         }
@@ -918,7 +1189,7 @@ def main():
             time.sleep(2)
             s = cl.snapshot()
             print(f"\r{s['state']:<10} {s['message'][:24]:<24} buffer {s['buffer_s']:4.1f} s  "
-                  f"{s['kbps']:5.1f} kbit/s  dropouts {s['underruns']}   ", end="", flush=True)
+                  f"{s['kbps']:5.1f} kbit/s  dropouts {s['underruns']}  card {s['card_gaps']}   ", end="", flush=True)
             if s["state"] in ("failed", "ended"):
                 print()
                 break

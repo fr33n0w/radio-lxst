@@ -283,6 +283,7 @@ class BpmCache:
         self.busy = None  # path being analysed now
         self.dur_only = set()  # queued only for the length or the loudness
         self.version = 0
+        self.done = []  # (version, path) of the last results: the GUI redraws only those rows
         self._wake = threading.Event()
         threading.Thread(target=self._worker, daemon=True).start()
 
@@ -345,6 +346,13 @@ class BpmCache:
         with self.lock:
             return path == self.busy or path in self.queue
 
+    def done_since(self, version):
+        """Paths analysed after that version, None if too many to tell (redraw all)."""
+        with self.lock:
+            if self.done and self.done[0][0] > version + 1:
+                return None
+            return [p for v, p in self.done if v > version]
+
     def pending(self):
         with self.lock:
             return len(self.queue) + (1 if self.busy else 0)
@@ -376,6 +384,7 @@ class BpmCache:
                 self.data[p] = r
                 self.busy = None
                 self.version += 1
+                self.done = self.done[-200:] + [(self.version, p)]
             self._save()
             time.sleep(0.05 if quick else 0.5)  # let the station breathe between tracks
 

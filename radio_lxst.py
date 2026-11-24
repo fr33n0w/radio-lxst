@@ -7,6 +7,7 @@ import json
 import time
 import types
 import random
+import signal
 import ctypes
 import argparse
 import threading
@@ -28,7 +29,35 @@ import bpm as bpmdet
 from LXST.Codecs import Opus
 from LXST.Codecs.libs.pyogg import opus, OpusEncoder
 
-__version__ = "0.6"
+
+def keep_path():
+    """LXST's pyogg adds to PATH with ';' on Linux too, glued to the last entry: under systemd that one is /usr/bin
+    and ffmpeg is gone. Repair PATH now and after every library it loads."""
+    if os.name == "nt":
+        return
+    os.environ["PATH"] = ":".join(p.split(";")[0] for p in os.environ.get("PATH", "").split(":"))
+    try:
+        from LXST.Codecs.libs.pyogg.library_loader import ExternalLibrary
+    except Exception:
+        return
+    orig = ExternalLibrary.load_other
+    if getattr(orig, "_keeps_path", False):
+        return
+
+    def load_other(*a, **k):
+        path = os.environ.get("PATH", "")
+        try:
+            return orig(*a, **k)
+        finally:
+            os.environ["PATH"] = path
+
+    load_other._keeps_path = True
+    ExternalLibrary.load_other = staticmethod(load_other)
+
+
+keep_path()
+
+__version__ = "0.7"
 
 APP_NAME = "lxst"
 ASPECT = "telephony"
@@ -55,19 +84,32 @@ PREFERRED_PROFILE = 0xFF
 
 SAMPLE_RATE = 48000
 CHANNELS = 2
-FRAME_MS = FRAME_SAMPLES = FRAME_BYTES = MAX_QUEUE_FRAMES = 0
+# audio moves in 60 ms frames; Steady only packs two of them in one 120 ms packet, so it changes live
+FRAME_MS = 60
+OUT_AVG_S = 3.0  # OUT level on the station display: seconds averaged (LUFS short-term is 3 s)
+FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000
+FRAME_BYTES = FRAME_SAMPLES * CHANNELS * 2
+MAX_QUEUE_FRAMES = int(3000 / FRAME_MS)
+PACKET_MS = 60  # packets to our clients: 60 High, 120 Steady (more jitter tolerance, less bitrate)
+
+
+PHONE_60 = True  # LXST phones get 60 ms whatever the quality (the LXST Opus presets; Sideband plays 120 too)
 
 
 def set_frame_ms(ms):
-    # Sideband buffers ~6 frames: longer frames = more jitter tolerance, less bitrate per packet
-    global FRAME_MS, FRAME_SAMPLES, FRAME_BYTES, MAX_QUEUE_FRAMES
-    FRAME_MS = ms
-    FRAME_SAMPLES = SAMPLE_RATE * ms // 1000
-    FRAME_BYTES = FRAME_SAMPLES * CHANNELS * 2
-    MAX_QUEUE_FRAMES = int(3000 / ms)
+    global PACKET_MS
+    PACKET_MS = 120 if int(ms) >= 120 else 60
 
 
-set_frame_ms(120)
+def set_phone_60(on):
+    global PHONE_60
+    PHONE_60 = bool(on)
+
+
+def quality_kb():
+    return 28 if PACKET_MS >= 120 else 56
+# LXST phones (Sideband, rnphone, Columba) get the standard 60 ms Opus packets: Columba's decoder holds 60 ms at most
+PHONE_FRAME_MS = 60
 ANSWER_DELAY = 1.0
 AUDIO_EXTS = (".mp3", ".ogg", ".opus", ".flac", ".wav", ".m4a", ".aac")
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -157,13 +199,18 @@ class Limiter:
 
 SILENCE = 10 ** (-50 / 20)  # below -50 dBFS = silence for the trim
 SILENCE_KEEP = 20           # s of silence kept inside a track, longer gaps are cut
-FOLDER_AHEAD = 8            # frames queued ahead in folder mode (~1 s)
+FOLDER_AHEAD = 25           # frames queued ahead in folder mode (1.5 s against a busy PC)
 PLAYLIST_FILE = "playlist.json"  # in the storage dir: track order per folder
 PLAYED_FILE = "played.json"  # in the storage dir: last played time per track
 NORM_LUFS = (-18, -8)  # Normalize targets allowed: -14 like streaming services, up to -8 for a hot master
 NORM_MAX_BOOST = 12   # dB: a very quiet track is raised at most this much (the limiter holds the peaks)
 FOLDER_HEADROOM = 0.25  # folder frames carry 12 dB of room above full scale, up to the limiter
 MIX_LOG_FILE = "beatmix.jsonl"
+
+
+def norm_gain_db(target, lufs):
+    """dB Normalize gives a track of that loudness."""
+    return min(NORM_MAX_BOOST, target - lufs)
 
 
 def pcm_frame(src, pcm):
@@ -258,6 +305,29 @@ class Playlist:
                     self.removed.add(p)
             self.order = [p for p in self.order if p not in gone]
             self._changed()
+
+    def clear(self):
+        """Empty the list: added sources forgotten, folder tracks removed. Files stay on disk; add the
+        folder again to bring its tracks back. The track on air plays to its end."""
+        with self.lock:
+            self._load_lists()
+            self.removed |= {p for p in self.order if self._under(p, self.folder)}
+            self.extra = []
+            self.order = []
+            self._idx, self._forced = 0, None
+            self._changed()
+
+    def remove_added(self, path):
+        """Forget a file or folder added from outside, with its tracks; the files stay on disk."""
+        with self.lock:
+            self._load_lists()
+            if path not in self.extra:
+                return False
+            self.extra.remove(path)
+            self.removed = {r for r in self.removed if not (r == path or self._under(r, path))}
+        self.rescan()
+        self.save()
+        return True
 
     def _load(self):
         try:
@@ -659,14 +729,29 @@ class _Grid:
 
 def probe_duration(path):
     """Track length in seconds with ffprobe, None if unknown."""
+    return probe_track(path)[0]
+
+
+def tag_title(tags, name):
+    """The file name, with the artist from the tags in front when the name lacks it ('Artist - Title')."""
+    t = {str(k).lower(): str(v).strip() for k, v in (tags or {}).items() if str(v).strip()}
+    artist = t.get("artist") or t.get("album_artist") or ""
+    if not artist or artist.lower() in name.lower():
+        return name
+    return f"{artist} - {t.get('title') or name}"
+
+
+def probe_track(path):
+    """(length in s or None, tags dict) with one ffprobe."""
     try:
-        out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
-                             capture_output=True, text=True, timeout=10,
+        out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration:format_tags",
+                              "-of", "json", path], capture_output=True, timeout=10,
                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
-        d = float(out.strip().splitlines()[0])
-        return d if d > 0 else None
+        fmt = json.loads(out.decode("utf-8", "replace") or "{}").get("format") or {}
+        d = float(fmt.get("duration") or 0)
+        return (d if d > 0 else None), fmt.get("tags") or {}
     except Exception:
-        return None
+        return None, {}
 
 
 class Source:
@@ -683,6 +768,7 @@ class Source:
         self.fade, self.mix, self.trim = fade, mix, trim
         self.beats, self.bpm_of = beats, bpm_of
         self.loop_out, self.loop_in, self.loop_n, self.loop_times = loop_out, loop_in, loop_n, loop_times
+        self.on_track = None  # called with the name of each folder track that starts
         self._grid = None  # beat grid of the track on air
         self._tail = None  # outgoing track waiting under the cursor for a beatmix
         self.last_mix = ""  # how the last change of track went, for the log/tests
@@ -755,6 +841,8 @@ class Source:
         self.track_dur, self._track_t0, self._track_lead = self._next_dur, time.monotonic() + wait, lead
         if path and self.playlist:
             self.playlist.mark_played(path)
+        if self.on_track:
+            self.on_track(name)
 
     def _loop(self):
         if self.folder:
@@ -837,7 +925,7 @@ class Source:
             return 1.0
         if lufs is None:
             return 1.0
-        return float(10 ** (min(NORM_MAX_BOOST, target - lufs) / 20))
+        return float(10 ** (norm_gain_db(target, lufs) / 20))
 
     def _bpm_info(self, path):
         try:
@@ -1112,7 +1200,8 @@ class Source:
             RNS.log("ffmpeg not found in PATH", RNS.LOG_ERROR)
             time.sleep(10)
             return False
-        self._next_dur = probe_duration(path)
+        self._next_dur, tags = probe_track(path)
+        shown = tag_title(tags, name)
         if plan:
             mix_at, win = tl["at"], int(round(tl["n"] * 60 / tl["bpm"] * sr))
             a = mix_at - self._flushed
@@ -1155,7 +1244,7 @@ class Source:
             if info and not plan:
                 self._grid = _Grid(self._cur, lead / sr, info[1], 60 / info[0])
             # a loop in holds the track at its start: the bar counts from that much earlier
-            self._track_started(name, (plan[0] - loop_extra / sr * plan[2][0] if plan else lead / sr), path)
+            self._track_started(shown, (plan[0] - loop_extra / sr * plan[2][0] if plan else lead / sr), path)
 
         lbuf = []  # loop in: the start of the incoming track, gathered until the loop and its seam are read
 
@@ -1397,7 +1486,8 @@ LIVE_MAX_FRAMES = 4  # live input: drop old frames past this, keeps latency low
 def _soundcard():
     if sys.platform == "win32":
         from LXST.Platforms.windows import soundcard
-        soundcard._com.init_com()  # COM is per thread on Windows
+        from radio_client import _com_init
+        _com_init()  # COM is per thread on Windows
     elif sys.platform == "darwin":
         from LXST.Platforms.darwin import soundcard
     else:
@@ -1509,6 +1599,10 @@ class Listener:
         self.since = time.time()
         self.sent_bytes = 0
         self.failed = 0
+        self.client = False  # a radio-lxst client (sent its name in the call): takes packets longer than 60 ms
+
+    def packet_ms(self):
+        return PACKET_MS if self.client or not PHONE_60 else PHONE_FRAME_MS
 
     @property
     def name(self):
@@ -1549,10 +1643,12 @@ class Radio:
         self.slots = 0  # max listeners, 0 = no limit
         self.lock = threading.Lock()
         self.encoders = {}
+        self._half = None  # first 60 ms of a Steady packet
         self.total_calls = 0
         self.peak_listeners = 0
         self.total_bytes = 0
         self.max_late = 0.0
+        self.out_power = 0.0  # what goes on air, 3 s average (L+R power, like LUFS without its weighting)
         self.norm_lufs = None  # Normalize target for folder tracks, None = off
         self.underruns = 0  # empty frames of a playing folder source
         self._underrun_log = 0.0
@@ -1572,6 +1668,8 @@ class Radio:
         self.status_hits = []
         self.station.register_request_handler("status", response_generator=self._status_request,
                                               allow=RNS.Destination.ALLOW_ALL)
+        from station_stats import Stats
+        self.stats = Stats(self)
         if lxmf_on:
             self.lxmf_on = True
         threading.Thread(target=self._prepare_stamps, daemon=True).start()
@@ -1681,6 +1779,8 @@ class Radio:
         if self.on_air:
             self.stop()
         self.encoders = {}
+        self._half = None  # first 60 ms of a Steady packet
+        source.on_track = self.stats.track
         self.source = source
         self.on_air = True
         self.on_air_since = time.time()
@@ -1699,6 +1799,7 @@ class Radio:
         self._xf_pos, self._xf_len = None, max(FRAME_SAMPLES, int(fade_s * SAMPLE_RATE))
         self._xf_deadline = time.monotonic() + SWITCH_WAIT
         self._old_source = old if self.on_air else None
+        source.on_track = self.stats.track
         self.source = source
         if old and not self.on_air:
             old.stop()
@@ -1755,6 +1856,7 @@ class Radio:
             self._old_source = None
         was_on = self.on_air
         self.on_air = False
+        self.stats.off_air(self.on_air_since)
         self.on_air_since = None
         with self.lock:
             ls = list(self.listeners.values())
@@ -1824,7 +1926,7 @@ class Radio:
         src = self.shown_source
         np_ = (src.now_playing if src.folder else self.live_np(src)) if src else ""
         m = {"v": __version__, "n": self.name[:48], "l": n, "s": self.slots, "np": np_[:64],
-             "kb": 28 if FRAME_MS >= 120 else 56, "air": self.on_air}
+             "kb": quality_kb(), "air": self.on_air}
         prog = src.track_progress(clamp=False) if src and hasattr(src, "track_progress") else None
         if src and src.stream_name:
             m["sn"] = src.stream_name[:64]  # stream name only, never the URL or the device
@@ -1842,7 +1944,7 @@ class Radio:
 
     def station_info(self):
         # the announce says who we are, never what changes: the state is asked with a status request
-        return mp.packb({"v": __version__, "n": self.name[:48], "kb": 28 if FRAME_MS >= 120 else 56})
+        return mp.packb({"v": __version__, "n": self.name[:48], "kb": quality_kb()})
 
     def _status_request(self, path, data, request_id, link_id, remote_identity, requested_at):
         now = time.time()
@@ -1853,12 +1955,15 @@ class Radio:
                 return None  # too many: no answer, the asker sees "no reply"
             hits.append(now)
             self.status_hits = hits
+        self.stats.inc("status_requests")
         return self.meta()
 
     # in-call info: LXST only reads keys 0x00/0x01, other phones ignore this one
-    def _send_meta(self, links, meta):
-        data = mp.packb({FIELD_META: meta})
-        for link in links:
+    def _send_meta(self, lsts, meta):
+        for lst in lsts:
+            # q/ms: what this listener gets (Opus profile, packet length)
+            data = mp.packb({FIELD_META: dict(meta, q=Opus.profile_name(lst.profile), ms=lst.packet_ms())})
+            link = lst.link
             try:
                 if link.status == RNS.Link.ACTIVE:
                     RNS.Packet(link, data, create_receipt=False).send()
@@ -1881,9 +1986,9 @@ class Radio:
             key = {k: v for k, v in m.items() if k != "tp"}  # the position alone is no change
             if key != last or time.time() - last_t >= META_REFRESH:
                 with self.lock:
-                    links = [l.link for l in self.listeners.values() if l.state == "listening"]
-                if links:
-                    self._send_meta(links, m)
+                    lsts = [l for l in self.listeners.values() if l.state == "listening"]
+                if lsts:
+                    self._send_meta(lsts, m)
                 last, last_t = key, time.time()
 
     def _announce_loop(self):
@@ -1926,7 +2031,8 @@ class Radio:
         if self.is_full(but=lst):
             # BUSY: Sideband/rnphone show "busy", our clients "station full"
             lst.state = "full"
-            self._send_meta([link], self.meta())
+            self.stats.inc("refused")
+            self._send_meta([lst], self.meta())
             self._signal(link, [STATUS_BUSY])
             RNS.log(f"Listener {lst.label} refused: all {self.slots} slots taken", RNS.LOG_NOTICE)
             threading.Timer(2.0, link.teardown).start()
@@ -1947,7 +2053,8 @@ class Radio:
         with self.lock:
             n = sum(1 for l in self.listeners.values() if l.state == "listening")
         self.peak_listeners = max(self.peak_listeners, n)
-        self._send_meta([lst.link], self.meta())
+        self.stats.listen(lst, n)
+        self._send_meta([lst], self.meta())
         RNS.log(f"Listener {lst.label} tuned in ({self.profile_label(lst)})", RNS.LOG_NOTICE)
 
     def _packet(self, lst, data):
@@ -1959,6 +2066,12 @@ class Radio:
         if not isinstance(msg, dict):
             return
         info = msg.get(FIELD_LISTENER)
+        if isinstance(info, dict) and not lst.client:
+            lst.client = True
+            if PACKET_MS > PHONE_FRAME_MS:
+                RNS.log(f"Listener {lst.name} is a radio-lxst client: {PACKET_MS} ms packets", RNS.LOG_VERBOSE)
+                if lst.state == "listening":
+                    self._send_meta([lst], self.meta())
         if isinstance(info, dict) and info.get("n"):
             name = "".join(c for c in str(info["n"]) if c.isprintable()).strip()[:32]
             if name and name != lst.user:
@@ -1973,24 +2086,27 @@ class Radio:
                 if lst.state == "listening":
                     lst.profile = PROFILE_MAP.get(lst.caller_profile, DEFAULT_PROFILE)
                     RNS.log(f"Listener {lst.label} switched to {self.profile_label(lst)}", RNS.LOG_NOTICE)
+                    self._send_meta([lst], self.meta())
 
     def _link_closed(self, link):
         with self.lock:
             lst = self.listeners.pop(link.link_id, None)
         if lst and lst.state == "listening":
+            self.stats.left(lst)
             RNS.log(f"Listener {lst.label} left after {RNS.prettytime(time.time() - lst.since)}", RNS.LOG_NOTICE)
 
     @staticmethod
     def profile_label(lst):
         cp = CALLER_PROFILE_NAMES.get(lst.caller_profile, "default")
-        return f"{cp} -> Opus {Opus.profile_name(lst.profile)}"
+        return f"{cp} -> Opus {Opus.profile_name(lst.profile)}" + ("" if lst.client else ", phone")
 
-    def _encoder(self, profile):
-        enc = self.encoders.get(profile)
+    def _encoder(self, profile, ms):
+        # one encoder per profile and packet length: each Opus stream stays continuous
+        enc = self.encoders.get((profile, ms))
         if enc is None:
             enc = RadioOpus(profile=profile)
             enc.source = _Src()
-            self.encoders[profile] = enc
+            self.encoders[(profile, ms)] = enc
         return enc
 
     # one encode per profile in use, same frame to every listener of that profile
@@ -2031,23 +2147,38 @@ class Radio:
                 frame = np.clip(frame, -1.0, 1.0)
             peak = np.abs(frame).max(axis=0)
             self.levels = (float(peak[0]), float(peak[1]))
+            self.out_power += (float(np.mean(frame * frame)) * 2 - self.out_power) * (FRAME_MS / 1000 / OUT_AVG_S)
             mon = self.monitor
             if mon is not None:
                 mon.push(frame)
             with self.lock:
                 active = [l for l in self.listeners.values() if l.state == "listening"]
+            # Steady: two frames in one 120 ms packet, the first one waits here
+            half, pair = self._half, None
+            if any(l.packet_ms() > FRAME_MS for l in active):
+                if half is None:
+                    self._half = frame
+                else:
+                    pair, self._half = np.concatenate((half, frame)), None
+            else:
+                self._half = None
             if not active:
                 continue
             packets = {}
             for lst in active:
-                if lst.profile not in packets:
+                ms = lst.packet_ms()
+                if ms > FRAME_MS and pair is None:
+                    continue
+                key = (lst.profile, ms)
+                if key not in packets:
                     try:
-                        enc = self._encoder(lst.profile).encode(frame)
-                        packets[lst.profile] = mp.packb({FIELD_FRAMES: CODEC_OPUS + bytes(enc)})
+                        enc = self._encoder(lst.profile, ms)
+                        data = enc.encode(pair if ms > FRAME_MS else frame)
+                        packets[key] = mp.packb({FIELD_FRAMES: CODEC_OPUS + bytes(data)})
                     except Exception as e:
                         RNS.log(f"Encode error: {e}", RNS.LOG_ERROR)
-                        packets[lst.profile] = None
-                data = packets[lst.profile]
+                        packets[key] = None
+                data = packets[key]
                 if not data or lst.link.status != RNS.Link.ACTIVE:
                     continue
                 if RNS.Packet(lst.link, data, create_receipt=False).send() is False:
@@ -2080,6 +2211,7 @@ class Radio:
             "mixing": src.mixing() if src and hasattr(src, "mixing") else False,
             "live_text": src.live_text() if src else "",
             "levels": self.levels, "late_ms": self.max_late * 1000,
+            "out_db": -0.691 + 10 * np.log10(self.out_power) if self.on_air and self.out_power > 1e-9 else None,
             "gain_db": self.gain_db, "limiter_on": self.limiter_on,
             "ceiling_db": self.limiter.ceiling_db,
             "reduction_db": self.limiter.reduction_db if self.limiter_on and self.on_air else 0.0,
@@ -2094,7 +2226,7 @@ class Radio:
     def status_text(self):
         s = self.snapshot()
         lines = [f"[{time.strftime('%H:%M:%S')}] {self.name}  listeners {s['listeners']}  "
-                 f"(total calls {s['calls']}, buffer {s['buffer_ms']} ms, {FRAME_MS} ms frames, "
+                 f"(total calls {s['calls']}, buffer {s['buffer_ms']} ms, {PACKET_MS} ms packets, "
                  f"send late max {s['late_ms']:.0f} ms)"]
         if s["waiting"]:
             lines[0] += f"  preparing stamps {s['stamps_done']}/{s['stamps_total']}, on air when ready"
@@ -2163,6 +2295,8 @@ def load_settings_file(path):
         d["no_lxmf"] = not s["lxmf_on"]
     if "limiter_on" in s:
         d["no_limiter"] = not s["limiter_on"]
+    if "phone_60" in s:
+        d["phone_any"] = not s["phone_60"]
     if s.get("fade_on"):
         d["fade"] = s.get("fade_s", 3)
     if s.get("mix_on"):
@@ -2211,7 +2345,7 @@ def main():
     ap.add_argument("--name", default="radio-lxst", help="station name in the announce")
     ap.add_argument("--identity", default=os.path.join(here, "storage", "identity"))
     ap.add_argument("--rnsconfig", default=None, help="Reticulum config dir")
-    ap.add_argument("--frame-ms", type=int, choices=[60, 120], default=120,
+    ap.add_argument("--frame-ms", type=int, choices=[60, 120], default=60,
                     help="120 = steadier on slow paths (max ~28 kbit/s), 60 = up to 56 kbit/s")
     ap.add_argument("--announce-every", type=int, default=60, help=f"minutes between announces (min {ANNOUNCE_MIN_EVERY}), 0 = only at start")
     ap.add_argument("--no-lxmf", action="store_true",
@@ -2221,79 +2355,154 @@ def main():
     ap.add_argument("--slots", type=int, default=0, help="max listeners at once (limits the upload), 0 = no limit")
     ap.add_argument("--gain", type=float, default=0.0, help="output volume in dB (-24..+12)")
     ap.add_argument("--no-limiter", action="store_true", help="disable the peak limiter")
+    ap.add_argument("--phone-any", action="store_true",
+                    help="Steady sends 120 ms packets to phones too (default: phones always get 60 ms)")
     ap.add_argument("--ceiling", type=float, default=-2.0, help="limiter ceiling in dBFS")
-    ap.add_argument("--status", type=int, default=15, help="seconds between status lines")
+    ap.add_argument("--status", type=int, default=15, help="seconds between status lines, 0 = none")
+    ap.add_argument("--ctl", nargs="*", metavar="COMMAND",
+                    help="talk to the station running with this identity: one command (e.g. --ctl next), "
+                         "or none for a prompt; --ctl help lists them")
+    ap.add_argument("--stats", action="store_true",
+                    help="statistics of the station with this identity (this run and all time) and exit")
     ap.add_argument("-v", "--verbose", action="count", default=0)
     pre, _ = ap.parse_known_args()
     announce_on_start = True
     src = {}
+    raw = {}
     if pre.settings:
         try:
             d, src, announce_on_start = load_settings_file(pre.settings)
+            with open(pre.settings, encoding="utf-8") as f:
+                raw = json.load(f)
         except (OSError, ValueError) as e:
             ap.error(f"cannot read --settings {pre.settings}: {e}")
         ap.set_defaults(**d)
     a = ap.parse_args()
+    storage = os.path.dirname(os.path.abspath(a.identity))
+    if a.ctl is not None:
+        import station_ctl
+        return station_ctl.ctl_main(storage, a.ctl)
+    if a.stats:
+        import station_ctl
+        import station_stats
+        lines = station_ctl.query(storage, "stats")
+        if lines is None:
+            # taken = the GUI station is running (it has no control channel)
+            lock = lock_station(storage) if os.path.isdir(storage) else None
+            running = lock is None and os.path.isdir(storage)
+            if lock:
+                lock.close()
+            lines = station_stats.offline_text(storage, running=running)
+        print("\n".join(lines))
+        return
     if a.list_inputs:
         print("\n".join(list_inputs()) or "no input devices found")
         return
     if not (a.url or a.folder or a.input):  # source from the settings file only if none given here
         a.url, a.folder, a.input = src.get("url"), src.get("folder"), src.get("input")
-    if not (a.url or a.folder or a.input):
-        ap.error("one of --url --folder --input is required (or a --settings file with a source)")
     if a.frame_ms not in (60, 120):
         ap.error(f"frame_ms must be 60 or 120, not {a.frame_ms}")
     set_frame_ms(a.frame_ms)
-    storage = os.path.dirname(os.path.abspath(a.identity))
+    set_phone_60(not a.phone_any)
     lock = lock_station(storage)
     if lock is None:
         sys.exit(already_on(storage))
 
+    import station_ctl
+    s = settings_from_args(a, raw, pre.settings, announce_on_start)
+    st = station_ctl.Station(storage, s, os.path.abspath(pre.settings) if pre.settings else None)
+
+    def log_line(line):
+        print(line, flush=True)
+        st.add_log(line)
     RNS.Reticulum(configdir=a.rnsconfig, loglevel=RNS.LOG_NOTICE + a.verbose)
+    RNS.logdest = RNS.LOG_CALLBACK
+    RNS.logcall = log_line
     import rns_watch
     rns_watch.start()
     import update_check
     update_check.watch(__version__, lambda v: RNS.log(f"New version {v} on GitHub: {update_check.REPO_URL}",
                                                       RNS.LOG_NOTICE))
-    radio = Radio(load_identity(a.identity), a.name, storage=os.path.dirname(os.path.abspath(a.identity)),
-                  lxmf_on=not a.no_lxmf)
-    radio.announce_on_start = bool(announce_on_start)
-    radio.slots = max(0, a.slots)
-    radio.announce_every_min = a.announce_every
-    radio.lxmf_every_h = a.lxmf_every
-    radio.gain_db = max(-24.0, min(12.0, a.gain))
-    radio.limiter_on = not a.no_limiter
-    radio.limiter.ceiling_db = min(0.0, a.ceiling)
-    pl = Playlist(a.folder, os.path.join(radio.storage, PLAYLIST_FILE), a.shuffle) if a.folder else None
-    cache = None
-    if a.normalize is not None:
-        radio.norm_lufs = max(NORM_LUFS[0], min(NORM_LUFS[1], a.normalize))
-    if pl and (a.beatmix > 0 or a.normalize is not None):
-        cache = bpmdet.BpmCache(os.path.join(radio.storage, bpmdet.BPM_FILE))
-        cache.want(pl.items())
-    radio.start(LineSource(a.input) if a.input else Source(url=a.url, folder=a.folder, shuffle=a.shuffle,
-                                                                 fade=a.fade, mix=a.mix, trim=a.trim_silence,
-                                                                 playlist=pl, beats=max(0, a.beatmix),
-                                                                 loop_out=a.loop_out, loop_in=a.loop_in,
-                                                                 loop_n=a.loop, loop_times=a.loop_times,
-                                                                 bpm_of=cache.get if cache else None,
-                                                                 mix_log=os.path.join(radio.storage, MIX_LOG_FILE),
-                                                                 norm=lambda: radio.norm_lufs))
+    radio = Radio(load_identity(a.identity), s["name"], storage=storage, lxmf_on=bool(s["lxmf_on"]))
+    st.radio = radio
+    st.apply_output()
+    ctl = station_ctl.Server(st, storage)
+    try:
+        where = ctl.start()
+    except OSError as e:
+        ctl, where = None, f"off ({e})"
+    has_src = a.url or a.folder or a.input
+    if has_src:
+        try:
+            st.go_on_air()
+        except station_ctl.CtlError as e:
+            print(f"  Not on air: {e}")
 
-    print(f"\n  {a.name}  " + ("on air" if radio.on_air else "preparing stamps, on air when ready"))
+    print(f"\n  {s['name']}  " + (("on air" if radio.on_air else "preparing stamps, on air when ready")
+                                 if has_src else "off air: no source set"))
     print(f"  Call this identity from Sideband / rnphone:  {radio.identity_hash}")
     print(f"  LXST destination: {radio.dest.hash.hex()}   LXMF: "
           + (radio.lxmf_hash if radio.lxmf_on else "off"))
-    print(f"  Source: {a.url or a.folder or a.input}\n")
+    print(f"  Source: {a.url or a.folder or a.input or '-'}")
+    print(f"  Control: {where}")
+    print(f"  Commands from another terminal: python radio_lxst.py"
+          + (f" --settings {pre.settings}" if pre.settings else f" --identity {a.identity}") + " --ctl\n")
+    def _term(*_):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, _term)  # kill / systemd stop: same clean stop as Ctrl+C
     try:
-        while True:
-            time.sleep(a.status)
-            print(radio.status_text(), flush=True)
+        while not st.stop_all.wait(a.status if a.status > 0 else 3600):
+            if a.status > 0:
+                print(radio.status_text(), flush=True)
     except KeyboardInterrupt:
         pass
+    radio.stats.save()
+    if radio.monitor:
+        radio.monitor.stop()
     radio.stop()
+    if ctl:
+        ctl.close()
     time.sleep(0.5)
+    import multiprocessing
+    for p in multiprocessing.active_children():
+        p.kill()  # stamp workers still hashing: they ignore SIGTERM (RNS handler inherited by the fork)
+
+
+def settings_from_args(a, raw, settings_file, announce_on_start):
+    """The station settings in the GUI settings.json keys: the file, then what the command line says."""
+    import station_ctl
+    s = dict(station_ctl.DEFAULTS)
+    s.update(raw)
+    base = os.path.dirname(os.path.abspath(settings_file)) if settings_file else os.getcwd()
+    for k in ("identity", "folder", "rnsconfig"):
+        s[k] = settings_path(s[k], base)
+    s.update(name=a.name, frame_ms=a.frame_ms, shuffle=bool(a.shuffle), trim_silence=bool(a.trim_silence),
+             announce_every_min=a.announce_every, lxmf_every_h=a.lxmf_every, slots=max(0, a.slots),
+             gain_db=max(-24.0, min(12.0, a.gain)), limiter_ceiling_db=min(0.0, a.ceiling),
+             lxmf_on=not a.no_lxmf, limiter_on=not a.no_limiter, phone_60=not a.phone_any, identity=os.path.abspath(a.identity),
+             rnsconfig=a.rnsconfig or "", announce_on_start=bool(announce_on_start),
+             loop_out=bool(a.loop_out), loop_in=bool(a.loop_in), loop_n=a.loop, loop_times=a.loop_times)
+    s["fade_on"] = a.fade > 0
+    if a.fade > 0:
+        s["fade_s"] = max(1, min(30, int(a.fade)))
+    s["mix_on"] = a.mix > 0
+    if a.mix > 0:
+        s["mix_s"] = max(1, min(30, int(a.mix)))
+    s["beat_on"] = a.beatmix > 0
+    if a.beatmix > 0:
+        s["beat_n"] = a.beatmix
+    s["norm_on"] = a.normalize is not None
+    if a.normalize is not None:
+        s["norm_lufs"] = max(NORM_LUFS[0], min(NORM_LUFS[1], a.normalize))
+    if a.input:
+        s.update(mode="line", input_device=a.input)
+    elif a.folder:
+        s.update(mode="folder", folder=os.path.abspath(a.folder))
+    elif a.url:
+        s.update(mode="url", url=a.url)
+    return s
 
 
 if __name__ == "__main__":
+    sys.modules.setdefault("radio_lxst", sys.modules[__name__])  # station_ctl sees this module, not a copy
     main()

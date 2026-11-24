@@ -13,6 +13,8 @@ LCD = "#2cff4a"
 LCD_DIM = "#145a1e"
 RED = "#ff3b30"
 AMBER = "#ffb020"
+CYAN = "#8be3ff"
+VIOLET = "#b48cff"
 # named Tk fonts, created by apply_style() from what the system has (Windows, Linux, macOS)
 UI_FONT = "RadioUi"
 TITLE_FONT = "RadioTitle"
@@ -41,6 +43,98 @@ def _make_fonts(root):
             _FONTS.append(tkfont.Font(root, name=name, family=fam, size=size, weight=weight, exists=False))
         except tk.TclError:
             tkfont.nametofont(name).configure(family=fam, size=size, weight=weight)
+
+
+def app_id(name):
+    """Windows: own taskbar entry and icon instead of python.exe's. Call before the first window."""
+    import sys
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(f"radio-lxst.{name}")
+        except Exception:
+            pass
+
+
+def set_icon(root, name):
+    """Window and taskbar icon from icons/<name>.ico (Windows) and icons/<name>-N.png."""
+    import os
+    import sys
+    d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons")
+    try:
+        if sys.platform == "win32":
+            ico = os.path.join(d, f"{name}.ico")
+            root.iconbitmap(default=ico)
+            for ms in (300, 2000):  # once the frame exists
+                root.after(ms, lambda: _win_seticon(root, ico))
+        imgs = [tk.PhotoImage(file=os.path.join(d, f"{name}-{n}.png")) for n in (256, 64, 48, 32, 16)]
+        root.iconphoto(True, *imgs)
+        root._icons = imgs  # Tk drops images without a Python reference
+    except Exception:
+        pass  # missing files or an old Tk: the default icon stays
+
+
+def _win_seticon(root, ico):
+    """Tk leaves WM_GETICON empty and the taskbar then shows python's icon: set both sizes on the real frame."""
+    try:
+        import os
+        import ctypes
+        u = ctypes.windll.user32
+        u.LoadImageW.restype = ctypes.c_void_p
+        u.SendMessageW.argtypes = (ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_void_p)
+        hwnd = int(root.wm_frame(), 16)
+        for which, metric in ((1, 11), (0, 49)):  # ICON_BIG / SM_CXICON, ICON_SMALL / SM_CXSMICON
+            n = u.GetSystemMetrics(metric)
+            h = u.LoadImageW(None, ico, 1, n, n, 0x10)  # IMAGE_ICON, LR_LOADFROMFILE
+            if h:
+                u.SendMessageW(hwnd, 0x80, which, h)  # WM_SETICON
+        name = os.path.splitext(os.path.basename(ico))[0]
+        _win_window_appid(hwnd, f"radio-lxst.{name}")
+    except Exception:
+        pass
+
+
+def _win_window_appid(hwnd, appid):
+    """App id on the window itself: the process one alone still left the windows grouped under python."""
+    import ctypes
+
+    class GUID(ctypes.Structure):
+        _fields_ = [("a", ctypes.c_ulong), ("b", ctypes.c_ushort), ("c", ctypes.c_ushort), ("d", ctypes.c_ubyte * 8)]
+
+    class PKEY(ctypes.Structure):
+        _fields_ = [("fmtid", GUID), ("pid", ctypes.c_ulong)]
+
+    class PROPVARIANT(ctypes.Structure):
+        _fields_ = [("vt", ctypes.c_ushort), ("r1", ctypes.c_ushort), ("r2", ctypes.c_ushort), ("r3", ctypes.c_ushort),
+                    ("p", ctypes.c_void_p), ("p2", ctypes.c_void_p)]
+
+    def guid(s):
+        g = GUID()
+        ctypes.windll.ole32.CLSIDFromString(ctypes.c_wchar_p(s), ctypes.byref(g))
+        return g
+
+    ctypes.windll.ole32.CoInitialize(None)
+    store = ctypes.c_void_p()
+    if ctypes.windll.shell32.SHGetPropertyStoreForWindow(
+            ctypes.c_void_p(hwnd), ctypes.byref(guid("{886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99}")), ctypes.byref(store)):
+        return
+    vt = ctypes.cast(ctypes.cast(store, ctypes.POINTER(ctypes.c_void_p))[0], ctypes.POINTER(ctypes.c_void_p))
+    proto = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.POINTER(PKEY), ctypes.POINTER(PROPVARIANT))
+    set_value, commit = proto(vt[6]), ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p)(vt[7])
+    release = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vt[2])
+    buf = ctypes.create_unicode_buffer(appid)
+    pv = PROPVARIANT(vt=31, p=ctypes.cast(buf, ctypes.c_void_p).value)  # VT_LPWSTR
+    set_value(store, ctypes.byref(PKEY(guid("{9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}"), 5)), ctypes.byref(pv))
+    commit(store)
+    release(store)
+
+
+def stop_children():
+    """Before os._exit: RNS stamp workers are forked processes and would keep hashing on every core.
+    kill, not terminate: they inherit the SIGTERM handler of RNS and do not stop on it."""
+    import multiprocessing
+    for p in multiprocessing.active_children():
+        p.kill()
 
 
 def hms(sec):
@@ -81,6 +175,9 @@ def apply_style(root):
     st.map("TMenubutton", background=[("active", "#5c5c70")])
     st.configure("Air.TButton", foreground=LCD)
     st.configure("Stop.TButton", foreground=RED)
+    st.configure("Next.TButton", foreground=CYAN)
+    st.configure("Mute.TButton", foreground=AMBER)
+    st.configure("Restart.TButton", foreground=VIOLET)
     st.configure("Treeview", background=LCD_BG, fieldbackground=LCD_BG, foreground=LCD,
                  rowheight=20, font=LCD_FONT, borderwidth=0)
     st.configure("Treeview.Heading", background=EDGE, foreground=TEXT, font=UI_FONT)
@@ -88,9 +185,28 @@ def apply_style(root):
 
 
 def volume_scale(parent, var, length=220):
-    return tk.Scale(parent, from_=-24, to=12, resolution=0.5, orient="horizontal", variable=var,
-                    showvalue=0, length=length, bg=BG, troughcolor=LCD_BG, activebackground=LCD,
-                    highlightthickness=0, bd=0, sliderlength=14, width=12)
+    """dB slider with a 0 dB tick under it; double click goes back to 0 dB."""
+    box = tk.Frame(parent, bg=BG)
+    sc = tk.Scale(box, from_=-24, to=12, resolution=0.5, orient="horizontal", variable=var,
+                  showvalue=0, length=length, bg=BG, troughcolor=LCD_BG, activebackground=LCD,
+                  highlightthickness=0, bd=0, sliderlength=14, width=12)
+    sc.pack(fill="x")
+    tick = tk.Canvas(box, width=1, height=5, bg=BG, highlightthickness=0)
+    tick.pack(fill="x")
+
+    def draw(_ev=None):
+        tick.delete("all")
+        x = sc.coords(0.0)[0]
+        tick.create_line(x, 0, x, 5, fill=LCD, width=2)
+
+    def zero(_ev):
+        var.set(0.0)
+        return "break"  # no trough step from the class binding
+
+    sc.bind("<Configure>", draw)
+    sc.bind("<Double-Button-1>", zero)
+    tick.bind("<Double-Button-1>", zero)
+    return box
 
 
 def _vu_y(db):
@@ -249,6 +365,33 @@ def rns_lost():
     return rns_watch.lost()
 
 
+def usage_watch(root, label):
+    """CPU and RAM of this program and its children (ffmpeg, BPM analysis) in `label` every 2 s; needs psutil."""
+    procs = {}
+
+    def tick():
+        try:
+            import psutil
+            me = procs.get("me") or procs.setdefault("me", psutil.Process())
+            cpu, ram, seen = 0.0, 0, {"me"}
+            for p in [me] + me.children(recursive=True):
+                q = procs.setdefault(p.pid, p)  # same object: cpu_percent counts since the last call
+                seen.add(p.pid)
+                try:
+                    cpu += q.cpu_percent(None)
+                    ram += q.memory_info().rss
+                except psutil.Error:
+                    pass
+            for k in set(procs) - seen:
+                del procs[k]
+            label.configure(text=f"CPU {cpu / (psutil.cpu_count() or 1):.0f}%   RAM {ram / 2**20:.0f} MB")
+        except Exception:
+            return  # no psutil: nothing shown
+        root.after(2000, tick)
+
+    tick()
+
+
 def rns_watch(root, before):
     """Red bar above `before` while the shared RNS instance is gone, green for 5 s when it is back."""
     import time
@@ -285,13 +428,23 @@ def rns_watch(root, before):
     return bar
 
 
-def about_tab(nb, app, current):
-    """About tab: version, repo link, update check each time the tab is shown."""
+def about_tab(nb, app, current, icon=None):
+    """About tab: icon and name, version, repo link, update check each time the tab is shown."""
+    import os
     import threading
     import webbrowser
     import update_check
     f = ttk.Frame(nb, padding=16)
-    tk.Label(f, text=app, bg=PANEL, fg=LCD, font=TITLE_FONT).pack(pady=(8, 2))
+    head = tk.Frame(f, bg=PANEL)
+    head.pack(pady=(8, 2))
+    if icon:
+        try:
+            img = tk.PhotoImage(file=os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons", f"{icon}-64.png"))
+            tk.Label(head, image=img, bg=PANEL).pack(pady=(0, 6))
+            head._img = img  # Tk drops images without a Python reference
+        except Exception:
+            pass
+    tk.Label(head, text=app, bg=PANEL, fg=LCD, font=TITLE_FONT).pack()
     tk.Label(f, text=f"version {current}", bg=PANEL, fg=TEXT, font=UI_FONT).pack()
     tk.Label(f, text="internet radio over Reticulum (LXST)", bg=PANEL, fg=DIM, font=UI_FONT).pack(pady=(2, 12))
     link = tk.Label(f, text=update_check.REPO_URL, bg=PANEL, fg=AMBER, font=UI_FONT, cursor="hand2")

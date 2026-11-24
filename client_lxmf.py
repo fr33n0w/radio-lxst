@@ -280,7 +280,18 @@ class Commands:
 
 if __name__ == "__main__" and len(sys.argv) == 4 and sys.argv[1] == "--stamp":
     # child of ensure_stamp(): the stamp work, away from the GUI process
+    import multiprocessing
+    import psutil
     from RNS.Stamps import generate_stamp
+
+    def _orphan_watch(ppid):
+        # client closed during the stamp: stop hashing instead of running on as an orphan
+        while psutil.pid_exists(ppid):
+            time.sleep(2)
+        for p in multiprocessing.active_children():
+            p.kill()
+        os._exit(1)
+    threading.Thread(target=_orphan_watch, args=(os.getppid(),), daemon=True).start()
     s, v = generate_stamp(bytes.fromhex(sys.argv[2]), stamp_cost=float(sys.argv[3]), expand_rounds=0,
                           size=RNS.Identity.STAMPLENGTH)
     print(s.hex(), v)
