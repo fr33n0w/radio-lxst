@@ -502,7 +502,7 @@ class App:
         self.mystats = lstats.MyStats(os.path.join(HERE, "storage"))
         f = ttk.Frame(nb, padding=6)
         self.ms_tree = ttk.Treeview(f, columns=("what", "today", "all"), show="headings", height=8)
-        for c, t, w, a in (("what", "", 150, "w"), ("today", "Today", 100, "e"), ("all", "All time", 150, "e")):
+        for c, t, w, a in (("what", "", 150, "w"), ("today", "Today", 100, "e"), ("all", "All time", 190, "e")):
             self.ms_tree.heading(c, text=t)
             self.ms_tree.column(c, width=w, anchor=a, stretch=c == "what")
         self.ms_tree.pack(side="left", fill="both", expand=True)
