@@ -69,7 +69,7 @@ python radio_lxst.py --settings settings.json --stats          # statistics (als
 nc -U storage/ctl.sock                                         # Linux: same text commands with netcat
 ```
 
-Use the same `--settings` (or `--identity`) as the station. Changes are saved in its settings file. The channel is local only: a Unix socket in the identity folder (owner only) on Linux and Mac, 127.0.0.1 with a token in `ctl.json` on Windows (send `auth TOKEN` first). The station prints all its addresses at start, `id` shows them again. Started with no source, it waits off air for one (`source folder PATH`, then `onair`).
+Use the same `--settings` (or `--identity`) as the station. Changes are saved in its settings file. The channel is local only: a Unix socket in the identity folder (owner only) on Linux and Mac, 127.0.0.1 with a token in `ctl.json` on Windows (send `auth TOKEN` first). The station prints all its addresses at start, `id` shows them again. Started with no source, it waits off air for one (`source folder PATH`, then `onair`). Only a station started from the terminal opens the channel (the GUI station has its buttons; `--stats` works with both). Plain text lines, so `nc` works too; `quit` leaves the station running, `shutdown` stops it.
 
 Playlist at the `--ctl` prompt (paths with spaces in quotes):
 
