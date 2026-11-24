@@ -4,6 +4,8 @@ Internet radio over [Reticulum](https://reticulum.network). Put a web radio stre
 
 Version 0.7 · [Reticulum License](LICENSE)
 
+**Install guide (PDF):** [English](docs/radio-lxst_Install_Guide_EN.pdf) · [Italiano](docs/radio-lxst_Guida_Installazione_IT.pdf) - Windows, Linux, Raspberry Pi, station and client, Sideband/Columba/rnphone, LXMF commands, updates and common errors.
+
 | Server | Client |
 |---|---|
 | ![server](screenshots/server.png) | ![client](screenshots/client.png) |
